@@ -1,0 +1,43 @@
+{
+  "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
+  "appId": "com.govimix.daw",
+  "productName": "GoViMix",
+  "copyright": "Copyright © 2026 GoViMix Audio",
+  "directories": {
+    "output": "release",
+    "buildResources": "electron"
+  },
+  "files": [
+    "dist/**/*",
+    "electron/**/*",
+    "package.json"
+  ],
+  "win": {
+    "icon": "electron/icon.ico",
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      },
+      {
+        "target": "portable",
+        "arch": ["x64"]
+      }
+    ],
+    "requestedExecutionLevel": "asInvoker"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "GoViMix",
+    "artifactName": "GoViMix-Setup-${version}.exe",
+    "installerIcon": "electron/icon.ico",
+    "uninstallerIcon": "electron/icon.ico"
+  },
+  "portable": {
+    "artifactName": "GoViMix-Portable-${version}.exe"
+  }
+}

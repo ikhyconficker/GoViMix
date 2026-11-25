@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: #080a0f;
+    color: #e2e8f0;
+    user-select: none;
+  }
+}
+
+.font-mono-tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom studio console scrollbars */
+.console-scroll::-webkit-scrollbar {
+  height: 8px;
+  width: 5px;
+}
+
+.console-scroll::-webkit-scrollbar-track {
+  background: #0b0e14;
+}
+
+.console-scroll::-webkit-scrollbar-thumb {
+  background: #232b3b;
+  border-radius: 4px;
+}
+
+.console-scroll::-webkit-scrollbar-thumb:hover {
+  background: #00e5ff66;
+}
+
+/* Subtle metallic fader cap texture */
+.fader-cap-surface {
+  background: linear-gradient(
+    180deg,
+    #3a4252 0%,
+    #252b36 18%,
+    #181c24 44%,
+    #0e1116 50%,
+    #181c24 56%,
+    #2a313e 84%,
+    #161a22 100%
+  );
+  box-shadow:
+    0 4px 10px rgba(0, 0, 0, 0.85),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.7);
+}

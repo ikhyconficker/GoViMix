@@ -1,0 +1,10 @@
+{
+  "name": "NeonMix Studio DAW",
+  "description": "Virtual DAW mixer console with dark neon aesthetics, real-time Web Audio DSP inserts and FX sends, multi-track arrangement, and ASIO driver routing.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
