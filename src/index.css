@@ -4,11 +4,18 @@
   :root {
     --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
     --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+    --theme-neon: #eaff00;
+    --theme-neon-soft: #f7ff6b;
+    --theme-neon-rgb: 234, 255, 0;
+    --theme-tint-bg: rgba(234, 255, 0, 0.08);
+    --theme-bg-main: #080a0f;
+    --theme-bg-panel: #0b0e15;
+    --theme-meter-mid: #facc15;
   }
 
   body {
     font-family: var(--font-sans);
-    background-color: #080a0f;
+    background-color: var(--theme-bg-main);
     color: #e2e8f0;
     user-select: none;
   }
@@ -35,7 +42,7 @@
 }
 
 .console-scroll::-webkit-scrollbar-thumb:hover {
-  background: #00e5ff66;
+  background: rgba(var(--theme-neon-rgb), 0.42);
 }
 
 /* Subtle metallic fader cap texture */

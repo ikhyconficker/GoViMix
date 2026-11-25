@@ -17,7 +17,7 @@ export const RotaryKnob: React.FC<RotaryKnobProps> = ({
   max,
   defaultValue = 0,
   size = 28,
-  neonColor = '#00e5ff',
+  neonColor = 'var(--theme-neon)',
   label,
   onChange,
 }) => {
@@ -104,7 +104,7 @@ export const RotaryKnob: React.FC<RotaryKnobProps> = ({
       onPointerUp={handlePointerUp}
       onDoubleClick={() => onChange(defaultValue)}
       onWheel={handleWheel}
-      className="relative inline-flex items-center justify-center rounded-full focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-400 cursor-ns-resize select-none shrink-0"
+      className="relative inline-flex items-center justify-center rounded-full focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--theme-neon)] cursor-ns-resize select-none shrink-0"
       style={{ width: size, height: size }}
     >
       <svg width={size} height={size} viewBox="0 0 36 36" className="overflow-visible">

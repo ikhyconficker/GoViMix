@@ -3,6 +3,8 @@ import {
   AudioDeviceInfo,
   ChannelState,
   MeterReading,
+  SpecialEffectPad,
+  SpecialEffectPreset,
   TransportState,
 } from '../types/mixer';
 
@@ -69,7 +71,10 @@ export class StudioAudioEngine {
   private ctx: AudioContext | null = null;
   private channelNodes = new Map<string, ChannelNodes>();
   private customBuffers = new Map<string, AudioBuffer>();
+  private channelFileSources = new Map<string, AudioBufferSourceNode>();
+  private sfxBuffers = new Map<string, AudioBuffer>();
   private activeBufferSources: AudioBufferSourceNode[] = [];
+  private activeSfxSources: AudioScheduledSourceNode[] = [];
   private schedulerTimer: number | null = null;
   private nextStepTime = 0;
   private currentStep = 0;
@@ -106,10 +111,16 @@ export class StudioAudioEngine {
           sampleRate,
         });
       } catch {
-        this.ctx = new AudioCtx({
-          latencyHint: 'interactive',
-          sampleRate,
-        });
+        try {
+          this.ctx = new AudioCtx({
+            latencyHint: 'interactive',
+            sampleRate,
+          });
+        } catch {
+          this.ctx = new AudioCtx({
+            latencyHint: 'interactive',
+          });
+        }
       }
       if (this.channelsSnapshot.length > 0) {
         this.rebuildGraph(this.channelsSnapshot);
@@ -715,29 +726,51 @@ export class StudioAudioEngine {
       src.connect(nodes.inputGain);
       nodes.micSource = src;
       nodes.micStream = stream;
+      if (ctx.state === 'suspended') {
+        await ctx.resume();
+      }
+      this.syncParameters(this.channelsSnapshot);
       return true;
     } catch {
       return false;
     }
   }
 
-  public async enableApplicationAudioInput(channelId: string): Promise<boolean> {
+  public hasActiveLiveStream(channelId: string): boolean {
+    const nodes = this.channelNodes.get(channelId);
+    if (!nodes?.micStream) return false;
+    return nodes.micStream.getAudioTracks().some((t) => t.readyState === 'live');
+  }
+
+  public async enableApplicationAudioInput(
+    channelId: string,
+    onEnded?: () => void
+  ): Promise<boolean> {
     const ctx = await this.ensureContext();
     const nodes = this.channelNodes.get(channelId);
     if (!nodes || !navigator.mediaDevices?.getDisplayMedia) return false;
 
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
+      const displayConstraints = {
         video: true,
         audio: {
           echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: false,
-        } as MediaTrackConstraints,
-      });
+        },
+        systemAudio: 'include',
+        selfBrowserSurface: 'exclude',
+        suppressLocalAudioPlayback: false,
+      } as unknown as DisplayMediaStreamOptions;
+
+      const stream = await navigator.mediaDevices.getDisplayMedia(displayConstraints);
       // Stop unused video tracks; keep only audio stream
       stream.getVideoTracks().forEach((vt) => vt.stop());
-      if (stream.getAudioTracks().length === 0) return false;
+      const audioTracks = stream.getAudioTracks();
+      if (audioTracks.length === 0) {
+        stream.getTracks().forEach((t) => t.stop());
+        return false;
+      }
 
       if (nodes.micSource) nodes.micSource.disconnect();
       if (nodes.micStream) nodes.micStream.getTracks().forEach((t) => t.stop());
@@ -746,10 +779,69 @@ export class StudioAudioEngine {
       src.connect(nodes.inputGain);
       nodes.micSource = src;
       nodes.micStream = stream;
+
+      audioTracks[0].onended = () => {
+        if (nodes.micSource === src) {
+          try {
+            src.disconnect();
+          } catch {
+            // ignore
+          }
+          nodes.micSource = undefined;
+          nodes.micStream = undefined;
+          onEnded?.();
+        }
+      };
+
+      if (ctx.state === 'suspended') {
+        await ctx.resume();
+      }
+      this.syncParameters(this.channelsSnapshot);
       return true;
     } catch {
       return false;
     }
+  }
+
+  public async playFileForChannel(channelId: string, sampleRate = 48000, loop = true): Promise<boolean> {
+    const buf = this.customBuffers.get(channelId);
+    if (!buf) return false;
+    const ctx = await this.ensureContext(sampleRate);
+    this.rebuildGraph(this.channelsSnapshot);
+    const nodes = this.channelNodes.get(channelId);
+    if (!nodes) return false;
+
+    this.stopFileForChannel(channelId);
+
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.loop = loop;
+    src.connect(nodes.inputGain);
+    src.onended = () => {
+      if (this.channelFileSources.get(channelId) === src) {
+        this.channelFileSources.delete(channelId);
+      }
+    };
+    this.channelFileSources.set(channelId, src);
+    src.start(ctx.currentTime);
+    return true;
+  }
+
+  public stopFileForChannel(channelId: string): void {
+    const existing = this.channelFileSources.get(channelId);
+    if (existing) {
+      try {
+        existing.stop();
+        existing.disconnect();
+      } catch {
+        // ignore already stopped
+      }
+      this.channelFileSources.delete(channelId);
+    }
+  }
+
+  public isFilePlaying(channelId: string): boolean {
+    return this.channelFileSources.has(channelId);
   }
 
   public async loadAudioFileForChannel(channelId: string, file: File): Promise<{ peaks: number[]; duration: number } | null> {
@@ -1191,6 +1283,503 @@ export class StudioAudioEngine {
 
     osc.start(now);
     osc.stop(now + 0.56);
+  }
+
+  public async loadSpecialEffectAudio(padId: string, file: File): Promise<string | null> {
+    const ctx = await this.ensureContext();
+    try {
+      const arr = await file.arrayBuffer();
+      const decoded = await ctx.decodeAudioData(arr);
+      this.sfxBuffers.set(padId, decoded);
+      return file.name;
+    } catch {
+      return null;
+    }
+  }
+
+  public clearSpecialEffectAudio(padId: string): void {
+    this.sfxBuffers.delete(padId);
+  }
+
+  public stopAllSpecialEffects(): void {
+    for (const src of this.activeSfxSources) {
+      try {
+        src.stop();
+        src.disconnect();
+      } catch {
+        // ignore already stopped
+      }
+    }
+    this.activeSfxSources = [];
+  }
+
+  private registerSfxSource(src: AudioScheduledSourceNode): void {
+    this.activeSfxSources.push(src);
+    src.onended = () => {
+      this.activeSfxSources = this.activeSfxSources.filter((s) => s !== src);
+    };
+  }
+
+  private createNoiseBuffer(ctx: AudioContext, durationSec: number): AudioBuffer {
+    const length = Math.max(1, Math.floor(ctx.sampleRate * durationSec));
+    const buf = ctx.createBuffer(1, length, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < length; i++) {
+      data[i] = Math.random() * 2 - 1;
+    }
+    return buf;
+  }
+
+  private createSoftClipCurve(drivePercent: number): Float32Array<ArrayBuffer> {
+    const samples = 1024;
+    const curve = new Float32Array(new ArrayBuffer(samples * 4));
+    const k = Math.max(0.5, (drivePercent / 100) * 18);
+    for (let i = 0; i < samples; i++) {
+      const x = (i * 2) / samples - 1;
+      curve[i] = ((1 + k) * x) / (1 + k * Math.abs(x));
+    }
+    return curve;
+  }
+
+  public async triggerSpecialEffectPad(
+    pad: SpecialEffectPad,
+    channelId = 'ch-7',
+    channels?: ChannelState[]
+  ): Promise<void> {
+    const ctx = await this.ensureContext();
+    if (channels && this.channelNodes.size === 0) {
+      this.rebuildGraph(channels);
+    }
+
+    const chNodes = this.channelNodes.get(channelId) ?? this.channelNodes.get('main-bus');
+    if (!chNodes) return;
+
+    const snapshot = channels ?? this.channelsSnapshot;
+    const chState = snapshot.find((c) => c.id === channelId);
+    const sfxPlugin = chState?.inserts.find((i) => i.type === 'special-fx');
+
+    const pluginEnabled = sfxPlugin ? sfxPlugin.enabled : true;
+    const pluginPitch = pluginEnabled ? (sfxPlugin?.params.pitch ?? 0) : 0;
+    const pluginTone = pluginEnabled ? (sfxPlugin?.params.tone ?? 4200) : 18000;
+    const pluginDrive = pluginEnabled ? (sfxPlugin?.params.drive ?? 18) : 0;
+    const pluginMix = sfxPlugin ? (sfxPlugin.enabled ? (sfxPlugin.params.mix ?? 100) / 100 : 1) : 1;
+
+    if (pluginMix <= 0.01) return;
+
+    const pitchFactor = Math.pow(2, (pad.pitchSemitones + pluginPitch) / 12);
+    const durSec = Math.max(0.15, Math.min(5.0, pad.durationMs / 1000));
+    const padGainVal = dbToLinear(pad.volumeDb) * Math.max(0.1, pluginMix);
+
+    const outGain = ctx.createGain();
+    outGain.gain.value = padGainVal;
+
+    const toneFilter = ctx.createBiquadFilter();
+    toneFilter.type = 'lowpass';
+    toneFilter.frequency.value = Math.max(350, Math.min(18000, pluginTone));
+
+    if (pluginDrive > 2) {
+      const shaper = ctx.createWaveShaper();
+      shaper.curve = this.createSoftClipCurve(pluginDrive);
+      shaper.oversample = '2x';
+      outGain.connect(shaper);
+      shaper.connect(toneFilter);
+    } else {
+      outGain.connect(toneFilter);
+    }
+    toneFilter.connect(chNodes.inputGain);
+
+    const now = ctx.currentTime;
+    const customBuf = this.sfxBuffers.get(pad.id);
+    if (customBuf) {
+      const src = ctx.createBufferSource();
+      src.buffer = customBuf;
+      src.playbackRate.value = pitchFactor;
+      src.connect(outGain);
+      this.registerSfxSource(src);
+      src.start(now);
+      return;
+    }
+
+    this.synthesizePreset(ctx, pad.preset, outGain, now, durSec, pitchFactor);
+  }
+
+  private synthesizePreset(
+    ctx: AudioContext,
+    preset: SpecialEffectPreset,
+    dest: AudioNode,
+    now: number,
+    durSec: number,
+    pitch: number
+  ): void {
+    const startOsc = (
+      type: OscillatorType,
+      freqStart: number,
+      freqEnd: number | null,
+      amp: number,
+      t0: number,
+      len: number
+    ) => {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(Math.max(20, freqStart * pitch), t0);
+      if (freqEnd !== null) {
+        osc.frequency.exponentialRampToValueAtTime(Math.max(20, freqEnd * pitch), t0 + len);
+      }
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.linearRampToValueAtTime(amp, t0 + Math.min(0.02, len * 0.2));
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + len);
+      osc.connect(g);
+      g.connect(dest);
+      this.registerSfxSource(osc);
+      osc.start(t0);
+      osc.stop(t0 + len + 0.02);
+    };
+
+    switch (preset) {
+      case 'airhorn': {
+        const hits = [0, 0.16, 0.34];
+        hits.forEach((off, idx) => {
+          const len = idx === 2 ? Math.max(0.35, durSec - off) : 0.12;
+          [440, 554.37, 659.25].forEach((f) => {
+            startOsc('sawtooth', f, f * 0.985, 0.22, now + off, len);
+          });
+        });
+        break;
+      }
+      case 'applause': {
+        const noise = ctx.createBufferSource();
+        noise.buffer = this.createNoiseBuffer(ctx, durSec);
+        const bp = ctx.createBiquadFilter();
+        bp.type = 'bandpass';
+        bp.frequency.setValueAtTime(1650 * pitch, now);
+        bp.Q.value = 0.7;
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.001, now);
+        g.gain.linearRampToValueAtTime(0.45, now + durSec * 0.18);
+        g.gain.setValueAtTime(0.4, now + durSec * 0.65);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + durSec);
+        noise.connect(bp);
+        bp.connect(g);
+        g.connect(dest);
+        this.registerSfxSource(noise);
+        noise.start(now);
+        noise.stop(now + durSec + 0.02);
+        break;
+      }
+      case 'laser': {
+        startOsc('sawtooth', 1750, 110, 0.45, now, durSec);
+        startOsc('sine', 2400, 180, 0.25, now, durSec * 0.85);
+        break;
+      }
+      case 'riser': {
+        startOsc('sawtooth', 110, 1480, 0.36, now, durSec);
+        const noise = ctx.createBufferSource();
+        noise.buffer = this.createNoiseBuffer(ctx, durSec);
+        const bp = ctx.createBiquadFilter();
+        bp.type = 'bandpass';
+        bp.frequency.setValueAtTime(300 * pitch, now);
+        bp.frequency.exponentialRampToValueAtTime(5200 * pitch, now + durSec);
+        bp.Q.value = 3.5;
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.02, now);
+        g.gain.linearRampToValueAtTime(0.35, now + durSec * 0.92);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + durSec);
+        noise.connect(bp);
+        bp.connect(g);
+        g.connect(dest);
+        this.registerSfxSource(noise);
+        noise.start(now);
+        noise.stop(now + durSec + 0.02);
+        break;
+      }
+      case 'subdrop': {
+        startOsc('sine', 120, 28, 0.75, now, durSec);
+        startOsc('triangle', 220, 42, 0.3, now, durSec * 0.6);
+        break;
+      }
+      case 'vinyl-stop': {
+        startOsc('sawtooth', 320, 24, 0.4, now, durSec);
+        startOsc('triangle', 640, 32, 0.25, now, durSec);
+        break;
+      }
+      case 'siren': {
+        const osc = ctx.createOscillator();
+        const lfo = ctx.createOscillator();
+        const lfoGain = ctx.createGain();
+        const g = ctx.createGain();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(760 * pitch, now);
+        lfo.frequency.setValueAtTime(3.2, now);
+        lfoGain.gain.setValueAtTime(240 * pitch, now);
+        lfo.connect(lfoGain);
+        lfoGain.connect(osc.frequency);
+        g.gain.setValueAtTime(0.001, now);
+        g.gain.linearRampToValueAtTime(0.32, now + 0.05);
+        g.gain.setValueAtTime(0.32, now + durSec * 0.8);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + durSec);
+        osc.connect(g);
+        g.connect(dest);
+        this.registerSfxSource(osc);
+        this.registerSfxSource(lfo);
+        osc.start(now);
+        lfo.start(now);
+        osc.stop(now + durSec + 0.02);
+        lfo.stop(now + durSec + 0.02);
+        break;
+      }
+      case 'laugh': {
+        const bursts = 5;
+        const step = Math.min(0.18, durSec / bursts);
+        for (let i = 0; i < bursts; i++) {
+          const t0 = now + i * step;
+          const base = 360 - i * 24;
+          startOsc('triangle', base, base * 0.72, 0.34, t0, step * 0.85);
+          startOsc('sine', base * 1.5, base * 1.1, 0.2, t0, step * 0.75);
+        }
+        break;
+      }
+      case 'bell': {
+        [880, 1318.5, 1760, 2637].forEach((f, idx) => {
+          startOsc('sine', f, null, 0.28 / (idx + 1), now, durSec);
+        });
+        break;
+      }
+      case 'whoosh': {
+        const noise = ctx.createBufferSource();
+        noise.buffer = this.createNoiseBuffer(ctx, durSec);
+        const bp = ctx.createBiquadFilter();
+        bp.type = 'bandpass';
+        bp.frequency.setValueAtTime(220 * pitch, now);
+        bp.frequency.exponentialRampToValueAtTime(3400 * pitch, now + durSec * 0.45);
+        bp.frequency.exponentialRampToValueAtTime(280 * pitch, now + durSec);
+        bp.Q.value = 1.8;
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.001, now);
+        g.gain.linearRampToValueAtTime(0.55, now + durSec * 0.42);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + durSec);
+        noise.connect(bp);
+        bp.connect(g);
+        g.connect(dest);
+        this.registerSfxSource(noise);
+        noise.start(now);
+        noise.stop(now + durSec + 0.02);
+        break;
+      }
+      case 'glitch': {
+        const slices = 7;
+        const step = durSec / slices;
+        for (let i = 0; i < slices; i++) {
+          const f = 190 + ((i * 277) % 1400);
+          startOsc(i % 2 === 0 ? 'square' : 'sawtooth', f, f * 1.3, 0.28, now + i * step, step * 0.75);
+        }
+        break;
+      }
+      case 'boom': {
+        startOsc('sine', 95, 24, 0.8, now, durSec);
+        const noise = ctx.createBufferSource();
+        noise.buffer = this.createNoiseBuffer(ctx, durSec);
+        const lp = ctx.createBiquadFilter();
+        lp.type = 'lowpass';
+        lp.frequency.setValueAtTime(850 * pitch, now);
+        lp.frequency.exponentialRampToValueAtTime(120, now + durSec);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.5, now);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + durSec);
+        noise.connect(lp);
+        lp.connect(g);
+        g.connect(dest);
+        this.registerSfxSource(noise);
+        noise.start(now);
+        noise.stop(now + durSec + 0.02);
+        break;
+      }
+      case 'chime': {
+        [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => {
+          startOsc('sine', f, null, 0.25, now + i * 0.08, Math.max(0.35, durSec - i * 0.08));
+        });
+        break;
+      }
+      case 'buzzer': {
+        startOsc('sawtooth', 145, 138, 0.38, now, durSec);
+        startOsc('square', 152, 146, 0.28, now, durSec);
+        break;
+      }
+      case 'scratch': {
+        const steps = [
+          { t: 0, f1: 280, f2: 880, len: 0.1 },
+          { t: 0.11, f1: 860, f2: 240, len: 0.1 },
+          { t: 0.24, f1: 260, f2: 1100, len: Math.max(0.14, durSec - 0.24) },
+        ];
+        steps.forEach((s) => {
+          startOsc('sawtooth', s.f1, s.f2, 0.36, now + s.t, s.len);
+        });
+        break;
+      }
+      case 'drumroll': {
+        const hits = 6;
+        const step = Math.min(0.09, (durSec * 0.75) / hits);
+        for (let i = 0; i < hits; i++) {
+          startOsc('triangle', 220, 100, 0.32, now + i * step, 0.07);
+        }
+        startOsc('sine', 160, 48, 0.65, now + hits * step, Math.max(0.2, durSec - hits * step));
+        break;
+      }
+      case 'echo-hit': {
+        const taps = [0, 0.22, 0.44, 0.66];
+        taps.forEach((off, idx) => {
+          if (off < durSec) {
+            startOsc('triangle', 440, 220, 0.45 * Math.pow(0.58, idx), now + off, 0.22);
+          }
+        });
+        break;
+      }
+      case 'fanfare': {
+        const notes = [
+          { f: 523.25, t: 0, len: 0.14 },
+          { f: 659.25, t: 0.14, len: 0.14 },
+          { f: 783.99, t: 0.28, len: 0.14 },
+          { f: 1046.5, t: 0.42, len: Math.max(0.35, durSec - 0.42) },
+        ];
+        notes.forEach((n) => {
+          startOsc('sawtooth', n.f, null, 0.24, now + n.t, n.len);
+          startOsc('triangle', n.f * 0.5, null, 0.2, now + n.t, n.len);
+        });
+        break;
+      }
+      case 'robot': {
+        const notes = [320, 240, 410, 290, 520];
+        const step = durSec / notes.length;
+        notes.forEach((f, i) => {
+          startOsc('square', f, f * 0.9, 0.25, now + i * step, step * 0.85);
+        });
+        break;
+      }
+      case 'clap': {
+        [0, 0.014, 0.028].forEach((off, idx) => {
+          const noise = ctx.createBufferSource();
+          const len = idx === 2 ? Math.max(0.18, durSec * 0.7) : 0.03;
+          noise.buffer = this.createNoiseBuffer(ctx, len);
+          const bp = ctx.createBiquadFilter();
+          bp.type = 'bandpass';
+          bp.frequency.setValueAtTime(1400 * pitch, now + off);
+          bp.Q.value = 1.6;
+          const g = ctx.createGain();
+          g.gain.setValueAtTime(0.55, now + off);
+          g.gain.exponentialRampToValueAtTime(0.0001, now + off + len);
+          noise.connect(bp);
+          bp.connect(g);
+          g.connect(dest);
+          this.registerSfxSource(noise);
+          noise.start(now + off);
+          noise.stop(now + off + len + 0.02);
+        });
+        break;
+      }
+      case 'cowbell': {
+        startOsc('square', 540, null, 0.28, now, Math.min(0.45, durSec));
+        startOsc('square', 800, null, 0.26, now, Math.min(0.45, durSec));
+        break;
+      }
+      case 'crash': {
+        const noise = ctx.createBufferSource();
+        noise.buffer = this.createNoiseBuffer(ctx, durSec);
+        const hp = ctx.createBiquadFilter();
+        hp.type = 'highpass';
+        hp.frequency.setValueAtTime(3200 * pitch, now);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.55, now);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + durSec);
+        noise.connect(hp);
+        hp.connect(g);
+        g.connect(dest);
+        this.registerSfxSource(noise);
+        noise.start(now);
+        noise.stop(now + durSec + 0.02);
+        break;
+      }
+      case 'sweep-down': {
+        startOsc('sawtooth', 1400, 75, 0.34, now, durSec);
+        const noise = ctx.createBufferSource();
+        noise.buffer = this.createNoiseBuffer(ctx, durSec);
+        const bp = ctx.createBiquadFilter();
+        bp.type = 'bandpass';
+        bp.frequency.setValueAtTime(4800 * pitch, now);
+        bp.frequency.exponentialRampToValueAtTime(220 * pitch, now + durSec);
+        bp.Q.value = 3.0;
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.38, now);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + durSec);
+        noise.connect(bp);
+        bp.connect(g);
+        g.connect(dest);
+        this.registerSfxSource(noise);
+        noise.start(now);
+        noise.stop(now + durSec + 0.02);
+        break;
+      }
+      case 'alarm': {
+        const pulses = 3;
+        const step = durSec / pulses;
+        for (let i = 0; i < pulses; i++) {
+          startOsc('sawtooth', 880, 620, 0.32, now + i * step, step * 0.72);
+        }
+        break;
+      }
+      case 'boing': {
+        const osc = ctx.createOscillator();
+        const lfo = ctx.createOscillator();
+        const lfoGain = ctx.createGain();
+        const g = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(210 * pitch, now);
+        osc.frequency.exponentialRampToValueAtTime(520 * pitch, now + durSec * 0.4);
+        lfo.frequency.setValueAtTime(14, now);
+        lfoGain.gain.setValueAtTime(65 * pitch, now);
+        lfo.connect(lfoGain);
+        lfoGain.connect(osc.frequency);
+        g.gain.setValueAtTime(0.45, now);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + durSec);
+        osc.connect(g);
+        g.connect(dest);
+        this.registerSfxSource(osc);
+        this.registerSfxSource(lfo);
+        osc.start(now);
+        lfo.start(now);
+        osc.stop(now + durSec + 0.02);
+        lfo.stop(now + durSec + 0.02);
+        break;
+      }
+      case 'coin': {
+        startOsc('square', 987.77, null, 0.25, now, 0.09);
+        startOsc('square', 1318.51, null, 0.25, now + 0.08, Math.max(0.25, durSec - 0.08));
+        break;
+      }
+      case 'zap': {
+        startOsc('square', 1200, 90, 0.4, now, durSec);
+        startOsc('sawtooth', 900, 65, 0.25, now, durSec);
+        break;
+      }
+      case 'gong': {
+        [110, 165, 224, 308].forEach((f, idx) => {
+          startOsc(idx % 2 === 0 ? 'sine' : 'triangle', f, f * 0.96, 0.35 / (idx + 1), now, durSec);
+        });
+        break;
+      }
+      case 'powerup': {
+        const steps = [261.63, 329.63, 392, 523.25, 659.25, 783.99];
+        const step = durSec / steps.length;
+        steps.forEach((f, i) => {
+          startOsc('triangle', f, f * 1.05, 0.3, now + i * step, step * 1.15);
+        });
+        break;
+      }
+      case 'custom':
+      default: {
+        startOsc('sine', 587.33, 440, 0.4, now, durSec);
+        break;
+      }
+    }
   }
 
   public async enumerateMidiDevices(): Promise<{ inputs: string[]; outputs: string[] }> {

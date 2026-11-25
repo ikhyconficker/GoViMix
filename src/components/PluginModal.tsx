@@ -1,7 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import { Power, X } from 'lucide-react';
 import { audioEngine } from '../audio/AudioEngine';
-import { ChannelState, InsertPlugin } from '../types/mixer';
+import { ChannelState, InsertPlugin, SpecialEffectPad } from '../types/mixer';
 import { CompressorModal } from './CompressorModal';
 import { DelayModal } from './DelayModal';
 import { EqualizerModal } from './EqualizerModal';
@@ -11,6 +11,7 @@ import { LimiterModal } from './LimiterModal';
 import { MultibandDynamicsModal } from './MultibandDynamicsModal';
 import { ReverbModal } from './ReverbModal';
 import { RotaryKnob } from './RotaryKnob';
+import { SpecialEffectModal } from './SpecialEffectModal';
 import { SpectrumModal } from './SpectrumModal';
 import { VuMeterModal } from './VuMeterModal';
 import { WiderModal } from './WiderModal';
@@ -18,6 +19,9 @@ import { WiderModal } from './WiderModal';
 interface PluginModalProps {
   channel: ChannelState;
   plugin: InsertPlugin;
+  sfxPads?: SpecialEffectPad[];
+  onTriggerSfxPad?: (pad: SpecialEffectPad) => void;
+  onStopAllSfx?: () => void;
   onClose: () => void;
   onUpdatePlugin: (channelId: string, pluginId: string, updater: (p: InsertPlugin) => InsertPlugin) => void;
 }
@@ -25,6 +29,9 @@ interface PluginModalProps {
 export const PluginModal: React.FC<PluginModalProps> = ({
   channel,
   plugin,
+  sfxPads,
+  onTriggerSfxPad,
+  onStopAllSfx,
   onClose,
   onUpdatePlugin,
 }) => {
@@ -42,6 +49,7 @@ export const PluginModal: React.FC<PluginModalProps> = ({
     plugin.type === 'gate' ||
     plugin.type === 'delay' ||
     plugin.type === 'harmony' ||
+    plugin.type === 'special-fx' ||
     isVuMeter;
 
   const setParam = (key: string, val: number) => {
@@ -271,6 +279,20 @@ export const PluginModal: React.FC<PluginModalProps> = ({
     );
   }
 
+  if (plugin.type === 'special-fx') {
+    return (
+      <SpecialEffectModal
+        channel={channel}
+        plugin={plugin}
+        pads={sfxPads}
+        onTriggerPad={onTriggerSfxPad}
+        onStopAll={onStopAllSfx}
+        onClose={onClose}
+        onUpdatePlugin={onUpdatePlugin}
+      />
+    );
+  }
+
   const knobDefs: { key: string; label: string; min: number; max: number; def: number; unit: string }[] = (() => {
     switch (plugin.type) {
       case 'megaphone':
@@ -302,7 +324,7 @@ export const PluginModal: React.FC<PluginModalProps> = ({
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-[540px] rounded-lg bg-[#0d1119] border border-cyan-500/35 shadow-[0_24px_80px_rgba(0,0,0,0.85)] overflow-hidden"
+        className="w-full max-w-[540px] rounded-lg bg-[#0d1119] border border-[rgba(var(--theme-neon-rgb),0.4)] shadow-[0_24px_80px_rgba(0,0,0,0.85)] overflow-hidden"
       >
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-2.5 bg-[#121824] border-b border-white/10">
@@ -314,7 +336,7 @@ export const PluginModal: React.FC<PluginModalProps> = ({
               }
               className={`p-1.5 rounded border transition-all ${
                 plugin.enabled
-                  ? 'bg-cyan-500/20 text-cyan-300 border-cyan-400/60 shadow-[0_0_10px_rgba(34,211,238,0.4)]'
+                  ? 'bg-[rgba(var(--theme-neon-rgb),0.2)] text-[var(--theme-neon-soft)] border-[rgba(var(--theme-neon-rgb),0.65)] shadow-[0_0_10px_rgba(var(--theme-neon-rgb),0.4)]'
                   : 'bg-[#1a202d] text-slate-500 border-white/10'
               }`}
             >
@@ -323,7 +345,7 @@ export const PluginModal: React.FC<PluginModalProps> = ({
             <div>
               <div className="flex items-center gap-2 text-sm font-semibold text-white leading-tight">
                 <span>{plugin.name}</span>
-                <span className="text-[10px] font-mono-tabular text-cyan-300">
+                <span className="text-[10px] font-mono-tabular text-[var(--theme-neon-soft)]">
                   {plugin.format ?? 'VST3'}
                 </span>
               </div>
@@ -370,7 +392,7 @@ export const PluginModal: React.FC<PluginModalProps> = ({
                   label={k.label}
                   onChange={(v) => setParam(k.key, v)}
                 />
-                <span className="text-[11px] font-mono-tabular text-cyan-300">
+                <span className="text-[11px] font-mono-tabular text-[var(--theme-neon-soft)]">
                   {val.toFixed(k.unit === 's' || k.key === 'ceiling' ? 1 : 0)} {k.unit}
                 </span>
               </div>

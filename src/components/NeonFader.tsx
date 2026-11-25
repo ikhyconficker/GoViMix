@@ -38,7 +38,7 @@ export function faderPosToDb(pos: number): number {
 
 export const NeonFader: React.FC<NeonFaderProps> = ({
   valueDb,
-  neonColor = '#00e5ff',
+  neonColor = 'var(--theme-neon)',
   isFx = false,
   onChange,
 }) => {
@@ -104,14 +104,14 @@ export const NeonFader: React.FC<NeonFaderProps> = ({
             >
               <span
                 className={`text-[9px] font-mono-tabular leading-none ${
-                  mark.db === 0 ? 'text-cyan-300 font-semibold' : 'text-slate-400/80'
+                  mark.db === 0 ? 'text-[var(--theme-neon-soft)] font-semibold' : 'text-slate-400/80'
                 }`}
               >
                 {mark.label}
               </span>
               <span
                 className={`block h-px ${
-                  mark.db === 0 ? 'w-1.5 bg-cyan-400/80' : 'w-1 bg-slate-500/60'
+                  mark.db === 0 ? 'w-1.5 bg-[rgba(var(--theme-neon-rgb),0.8)]' : 'w-1 bg-slate-500/60'
                 }`}
               />
             </div>
@@ -144,7 +144,7 @@ export const NeonFader: React.FC<NeonFaderProps> = ({
 
         {/* 0 dB unity tick across slot */}
         <div
-          className="absolute left-0.5 right-0.5 h-px bg-cyan-400/40 pointer-events-none"
+          className="absolute left-0.5 right-0.5 h-px bg-[rgba(var(--theme-neon-rgb),0.4)] pointer-events-none"
           style={{ bottom: `calc(${dbToFaderPos(0) * 100}% - ${dbToFaderPos(0) * 24 - 12}px)` }}
         />
 
@@ -152,7 +152,7 @@ export const NeonFader: React.FC<NeonFaderProps> = ({
         <div
           className={`absolute left-1/2 -translate-x-1/2 w-[22px] h-[30px] rounded-[3px] border pointer-events-none flex flex-col items-center justify-center ${
             isFx
-              ? 'border-sky-300/60 bg-gradient-to-b from-sky-400/80 via-blue-700/90 to-slate-900'
+              ? 'border-[rgba(var(--theme-neon-rgb),0.6)] bg-[#141a26]'
               : 'fader-cap-surface border-slate-400/40'
           }`}
           style={{

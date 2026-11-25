@@ -6,6 +6,7 @@ import {
   PluginCatalogItem,
   PluginFormat,
   PluginType,
+  SpecialEffectPad,
   TransportState,
 } from '../types/mixer';
 
@@ -218,6 +219,13 @@ export const PLUGIN_CATALOG: PluginCatalogItem[] = [
     type: 'harmony',
     defaultParams: { voiceCount: 2, detune: 14, width: 80, mix: 45 },
   },
+  {
+    name: 'Special Effect',
+    format: 'VST3',
+    vendor: 'GoViMix DSP',
+    type: 'special-fx',
+    defaultParams: { pitch: 0, tone: 4200, drive: 18, mix: 100 },
+  },
 ];
 
 const mkPlugin = (
@@ -241,15 +249,19 @@ const mkPlugin = (
   };
 };
 
+export const UNIFORM_CHANNEL_COLOR = {
+  stripColor: '#eaff00',
+  neonAccent: '#eaff00',
+  tintBg: 'rgba(234, 255, 0, 0.08)',
+};
+
 export const INITIAL_CHANNELS: ChannelState[] = [
   {
     id: 'ch-1',
     index: 1,
     name: 'RECORD',
     type: 'audio',
-    stripColor: '#ef4444',
-    neonAccent: '#ff3b5c',
-    tintBg: 'rgba(127, 29, 29, 0.22)',
+    ...UNIFORM_CHANNEL_COLOR,
     inputGainDb: 0.0,
     polarityLeft: true,
     polarityRight: true,
@@ -272,9 +284,7 @@ export const INITIAL_CHANNELS: ChannelState[] = [
     index: 2,
     name: 'MUSIK',
     type: 'audio',
-    stripColor: '#06b6d4',
-    neonAccent: '#00d4ff',
-    tintBg: 'rgba(8, 51, 68, 0.22)',
+    ...UNIFORM_CHANNEL_COLOR,
     inputGainDb: 0.0,
     polarityLeft: true,
     polarityRight: true,
@@ -302,9 +312,7 @@ export const INITIAL_CHANNELS: ChannelState[] = [
     index: 3,
     name: 'VOCAL',
     type: 'audio',
-    stripColor: '#10b981',
-    neonAccent: '#00f5a0',
-    tintBg: 'rgba(6, 95, 70, 0.28)',
+    ...UNIFORM_CHANNEL_COLOR,
     inputGainDb: 0.0,
     polarityLeft: true,
     polarityRight: true,
@@ -335,9 +343,7 @@ export const INITIAL_CHANNELS: ChannelState[] = [
     index: 4,
     name: 'REVERB',
     type: 'audio',
-    stripColor: '#f59e0b',
-    neonAccent: '#fbbf24',
-    tintBg: 'rgba(120, 53, 15, 0.22)',
+    ...UNIFORM_CHANNEL_COLOR,
     inputGainDb: 0.0,
     polarityLeft: true,
     polarityRight: true,
@@ -362,9 +368,7 @@ export const INITIAL_CHANNELS: ChannelState[] = [
     index: 5,
     name: 'DELAY',
     type: 'audio',
-    stripColor: '#0ea5e9',
-    neonAccent: '#38bdf8',
-    tintBg: 'rgba(12, 74, 110, 0.22)',
+    ...UNIFORM_CHANNEL_COLOR,
     inputGainDb: 0.0,
     polarityLeft: true,
     polarityRight: true,
@@ -389,9 +393,7 @@ export const INITIAL_CHANNELS: ChannelState[] = [
     index: 6,
     name: 'HARMONI',
     type: 'audio',
-    stripColor: '#6366f1',
-    neonAccent: '#818cf8',
-    tintBg: 'rgba(49, 46, 129, 0.25)',
+    ...UNIFORM_CHANNEL_COLOR,
     inputGainDb: 0.0,
     polarityLeft: true,
     polarityRight: true,
@@ -414,11 +416,9 @@ export const INITIAL_CHANNELS: ChannelState[] = [
   {
     id: 'ch-7',
     index: 7,
-    name: '',
+    name: 'SPECIAL EFF',
     type: 'audio',
-    stripColor: '#8b5cf6',
-    neonAccent: '#a78bfa',
-    tintBg: 'rgba(76, 29, 149, 0.16)',
+    ...UNIFORM_CHANNEL_COLOR,
     inputGainDb: 0.0,
     polarityLeft: false,
     polarityRight: false,
@@ -426,13 +426,16 @@ export const INITIAL_CHANNELS: ChannelState[] = [
     mute: false,
     solo: false,
     recordArm: false,
-    monitor: false,
+    monitor: true,
     stereoMode: true,
     faderDb: 0.0,
     automationMode: 'Off',
     inputSource: 'none',
     inputChannelIndex: 7,
-    inserts: [],
+    inputLabel: 'SFX Pad Bank',
+    inserts: [
+      mkPlugin('ins-7-1', 'Special Effect', 'VST3', 'GoViMix DSP', 'special-fx', true),
+    ],
     sends: [],
   },
   {
@@ -440,9 +443,7 @@ export const INITIAL_CHANNELS: ChannelState[] = [
     index: 8,
     name: '',
     type: 'audio',
-    stripColor: '#ec4899',
-    neonAccent: '#f472b6',
-    tintBg: 'rgba(131, 24, 67, 0.16)',
+    ...UNIFORM_CHANNEL_COLOR,
     inputGainDb: 0.0,
     polarityLeft: false,
     polarityRight: false,
@@ -464,9 +465,7 @@ export const INITIAL_CHANNELS: ChannelState[] = [
     index: 99,
     name: 'Main',
     type: 'master',
-    stripColor: '#06b6d4',
-    neonAccent: '#00e5ff',
-    tintBg: 'rgba(8, 51, 68, 0.18)',
+    ...UNIFORM_CHANNEL_COLOR,
     inputGainDb: 0.0,
     polarityLeft: false,
     polarityRight: false,
@@ -493,9 +492,7 @@ export const INITIAL_CHANNELS: ChannelState[] = [
     index: 100,
     name: 'TTLS',
     type: 'listen',
-    stripColor: '#475569',
-    neonAccent: '#94a3b8',
-    tintBg: 'rgba(15, 23, 42, 0.35)',
+    ...UNIFORM_CHANNEL_COLOR,
     inputGainDb: 0.0,
     polarityLeft: false,
     polarityRight: false,
@@ -512,6 +509,39 @@ export const INITIAL_CHANNELS: ChannelState[] = [
     inserts: [],
     sends: [],
   },
+];
+
+export const INITIAL_SPECIAL_EFFECT_PADS: SpecialEffectPad[] = [
+  { id: 'sfx-1', index: 1, label: 'Airhorn', preset: 'airhorn', pitchSemitones: 0, durationMs: 850, volumeDb: 0 },
+  { id: 'sfx-2', index: 2, label: 'Applause', preset: 'applause', pitchSemitones: 0, durationMs: 1800, volumeDb: -2 },
+  { id: 'sfx-3', index: 3, label: 'Laser', preset: 'laser', pitchSemitones: 0, durationMs: 420, volumeDb: -1 },
+  { id: 'sfx-4', index: 4, label: 'Riser', preset: 'riser', pitchSemitones: 0, durationMs: 1600, volumeDb: -2 },
+  { id: 'sfx-5', index: 5, label: 'Sub Drop', preset: 'subdrop', pitchSemitones: 0, durationMs: 1200, volumeDb: 0 },
+  { id: 'sfx-6', index: 6, label: 'Vinyl Stop', preset: 'vinyl-stop', pitchSemitones: 0, durationMs: 900, volumeDb: -1 },
+  { id: 'sfx-7', index: 7, label: 'Siren', preset: 'siren', pitchSemitones: 0, durationMs: 1300, volumeDb: -3 },
+  { id: 'sfx-8', index: 8, label: 'Rimshot', preset: 'drumroll', pitchSemitones: 0, durationMs: 650, volumeDb: 0 },
+  { id: 'sfx-9', index: 9, label: 'Ding Bell', preset: 'bell', pitchSemitones: 0, durationMs: 1100, volumeDb: -2 },
+  { id: 'sfx-10', index: 10, label: 'Whoosh', preset: 'whoosh', pitchSemitones: 0, durationMs: 750, volumeDb: -1 },
+  { id: 'sfx-11', index: 11, label: 'Glitch', preset: 'glitch', pitchSemitones: 0, durationMs: 550, volumeDb: -2 },
+  { id: 'sfx-12', index: 12, label: 'Boom', preset: 'boom', pitchSemitones: 0, durationMs: 1400, volumeDb: 0 },
+  { id: 'sfx-13', index: 13, label: 'Chime', preset: 'chime', pitchSemitones: 0, durationMs: 1200, volumeDb: -2 },
+  { id: 'sfx-14', index: 14, label: 'Buzzer', preset: 'buzzer', pitchSemitones: 0, durationMs: 700, volumeDb: -3 },
+  { id: 'sfx-15', index: 15, label: 'Scratch', preset: 'scratch', pitchSemitones: 0, durationMs: 520, volumeDb: -1 },
+  { id: 'sfx-16', index: 16, label: 'Crowd FX', preset: 'laugh', pitchSemitones: 0, durationMs: 1400, volumeDb: -2 },
+  { id: 'sfx-17', index: 17, label: 'Echo Hit', preset: 'echo-hit', pitchSemitones: 0, durationMs: 1100, volumeDb: -1 },
+  { id: 'sfx-18', index: 18, label: 'Fanfare', preset: 'fanfare', pitchSemitones: 0, durationMs: 1300, volumeDb: -1 },
+  { id: 'sfx-19', index: 19, label: 'Robot', preset: 'robot', pitchSemitones: 0, durationMs: 800, volumeDb: -2 },
+  { id: 'sfx-20', index: 20, label: 'Drop Hit', preset: 'subdrop', pitchSemitones: -4, durationMs: 1000, volumeDb: 0 },
+  { id: 'sfx-21', index: 21, label: 'Hand Clap', preset: 'clap', pitchSemitones: 0, durationMs: 500, volumeDb: -1 },
+  { id: 'sfx-22', index: 22, label: 'Cowbell', preset: 'cowbell', pitchSemitones: 0, durationMs: 420, volumeDb: -1 },
+  { id: 'sfx-23', index: 23, label: 'Crash', preset: 'crash', pitchSemitones: 0, durationMs: 1700, volumeDb: -2 },
+  { id: 'sfx-24', index: 24, label: 'DownSweep', preset: 'sweep-down', pitchSemitones: 0, durationMs: 1100, volumeDb: -1 },
+  { id: 'sfx-25', index: 25, label: 'Klaxon', preset: 'alarm', pitchSemitones: 0, durationMs: 1000, volumeDb: -3 },
+  { id: 'sfx-26', index: 26, label: 'Boing', preset: 'boing', pitchSemitones: 0, durationMs: 650, volumeDb: -1 },
+  { id: 'sfx-27', index: 27, label: 'Coin FX', preset: 'coin', pitchSemitones: 0, durationMs: 480, volumeDb: -2 },
+  { id: 'sfx-28', index: 28, label: 'Zap', preset: 'zap', pitchSemitones: 0, durationMs: 380, volumeDb: -1 },
+  { id: 'sfx-29', index: 29, label: 'Deep Gong', preset: 'gong', pitchSemitones: 0, durationMs: 2200, volumeDb: 0 },
+  { id: 'sfx-30', index: 30, label: 'Power Up', preset: 'powerup', pitchSemitones: 0, durationMs: 850, volumeDb: -2 },
 ];
 
 export const BUILTIN_SEND_BUSES = [
@@ -565,6 +595,6 @@ function makePeaks(seed: number, len = 48): number[] {
 }
 
 export const INITIAL_CLIPS: ArrangementClip[] = [
-  { id: 'clip-2-1', channelId: 'ch-2', name: 'Musik_Backing_120BPM.wav', startSec: 0, durationSec: 16, color: '#00d4ff', peaks: makePeaks(1.4, 64) },
+  { id: 'clip-2-1', channelId: 'ch-2', name: 'Musik_Backing_120BPM.wav', startSec: 0, durationSec: 16, color: '#eaff00', peaks: makePeaks(1.4, 64) },
   { id: 'clip-3-1', channelId: 'ch-3', name: 'Vocal_Main_Take.wav', startSec: 0, durationSec: 16, color: '#00f5a0', peaks: makePeaks(3.2, 56) },
 ];

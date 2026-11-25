@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, Menu, shell } = require('electron');
+const { app, BrowserWindow, session, Menu, shell, desktopCapturer } = require('electron');
 const path = require('path');
 
 // Prioritize ultra-low-latency Web Audio & prevent background throttling during live mixing
@@ -56,6 +56,19 @@ function createWindow() {
     const allowed = ['media', 'audioCapture', 'midi', 'midiSysex', 'fullscreen'];
     return allowed.includes(permission);
   });
+
+  if (typeof session.defaultSession.setDisplayMediaRequestHandler === 'function') {
+    session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
+      desktopCapturer
+        .getSources({ types: ['screen', 'window'] })
+        .then((sources) => {
+          callback({ video: sources[0], audio: 'loopback' });
+        })
+        .catch(() => {
+          callback({});
+        });
+    });
+  }
 
   const devUrl = process.env.VITE_DEV_SERVER_URL;
   if (devUrl) {

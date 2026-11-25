@@ -16,7 +16,51 @@ export type PluginType =
   | 'meter'
   | 'wider'
   | 'ducking'
-  | 'multiband';
+  | 'multiband'
+  | 'special-fx';
+
+export type SpecialEffectPreset =
+  | 'airhorn'
+  | 'applause'
+  | 'laser'
+  | 'riser'
+  | 'subdrop'
+  | 'vinyl-stop'
+  | 'siren'
+  | 'laugh'
+  | 'bell'
+  | 'whoosh'
+  | 'glitch'
+  | 'boom'
+  | 'chime'
+  | 'buzzer'
+  | 'scratch'
+  | 'drumroll'
+  | 'echo-hit'
+  | 'fanfare'
+  | 'robot'
+  | 'clap'
+  | 'cowbell'
+  | 'crash'
+  | 'sweep-down'
+  | 'alarm'
+  | 'boing'
+  | 'coin'
+  | 'zap'
+  | 'gong'
+  | 'powerup'
+  | 'custom';
+
+export interface SpecialEffectPad {
+  id: string;
+  index: number;
+  label: string;
+  preset: SpecialEffectPreset;
+  pitchSemitones: number;
+  durationMs: number;
+  volumeDb: number;
+  audioFileName?: string;
+}
 
 export type AutomationMode = 'Off' | 'Read' | 'Touch' | 'Latch' | 'Write';
 
@@ -113,6 +157,7 @@ export interface AsioDriverConfig {
   outputChannels: number;
   baseLatencyMs: number;
   outputLatencyMs: number;
+  releaseInBackground?: boolean;
 }
 
 export interface TransportState {
@@ -143,4 +188,26 @@ export interface MeterReading {
   right: number; // 0..1 normalized
   peakDb: number;
   clipped: boolean;
+}
+
+export type ThemePresetId =
+  | 'neon-yellow'
+  | 'cyber-cyan'
+  | 'emerald-matrix'
+  | 'plasma-magenta'
+  | 'amber-gold'
+  | 'crimson-studio'
+  | 'custom';
+
+export interface ThemePreset {
+  id: ThemePresetId;
+  name: string;
+  description: string;
+  neon: string;
+  neonSoft: string;
+  neonRgb: string;
+  tintBg: string;
+  bgMain: string;
+  bgPanel: string;
+  meterMid: string;
 }

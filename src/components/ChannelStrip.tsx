@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   AudioWaveform,
   Check,
@@ -59,7 +59,7 @@ interface ChannelStripProps {
 const AUTO_MODES: AutomationMode[] = ['Off', 'Read', 'Touch', 'Latch', 'Write'];
 
 const FORMAT_BADGE: Record<PluginFormat, { label: string; cls: string }> = {
-  VST3: { label: 'V3', cls: 'text-cyan-300 border-cyan-500/40 bg-cyan-500/10' },
+  VST3: { label: 'V3', cls: 'text-[var(--theme-neon-soft)] border-[rgba(var(--theme-neon-rgb),0.45)] bg-[rgba(var(--theme-neon-rgb),0.1)]' },
   AAX: { label: 'AAX', cls: 'text-violet-300 border-violet-500/40 bg-violet-500/10' },
   VST2: { label: 'V2', cls: 'text-amber-300 border-amber-500/40 bg-amber-500/10' },
 };
@@ -75,6 +75,234 @@ function inferPluginTypeFromName(fileName: string): PluginType {
   if (lower.includes('mega')) return 'megaphone';
   if (lower.includes('harm') || lower.includes('tune')) return 'harmony';
   return 'pro-eq';
+}
+
+interface SmoothedMeterState {
+  left: number;
+  right: number;
+  peakHoldLeft: number;
+  peakHoldRight: number;
+  holdTimerLeft: number;
+  holdTimerRight: number;
+  peakDb: number;
+  peakDbLeft: number;
+  peakDbRight: number;
+  dbHoldTimerLeft: number;
+  dbHoldTimerRight: number;
+}
+
+const INITIAL_SMOOTHED_METER: SmoothedMeterState = {
+  left: 0,
+  right: 0,
+  peakHoldLeft: 0,
+  peakHoldRight: 0,
+  holdTimerLeft: 0,
+  holdTimerRight: 0,
+  peakDb: -60,
+  peakDbLeft: -60,
+  peakDbRight: -60,
+  dbHoldTimerLeft: 0,
+  dbHoldTimerRight: 0,
+};
+
+const VU_ATTACK_TAU_S = 0.022;
+const VU_RELEASE_TAU_S = 0.18;
+const PEAK_HOLD_DURATION_S = 0.42;
+const PEAK_HOLD_RELEASE_TAU_S = 0.28;
+const DB_ATTACK_TAU_S = 0.02;
+const DB_HOLD_DURATION_S = 0.16;
+const DB_HOLD_DRIFT_TAU_S = 0.55;
+const DB_RELEASE_TAU_S = 0.24;
+
+function expSmooth(current: number, target: number, dtSec: number, tauSec: number): number {
+  const alpha = 1 - Math.exp(-dtSec / Math.max(0.001, tauSec));
+  return current + (target - current) * alpha;
+}
+
+/**
+ * Applies frame-rate-independent attack/release ballistics and peak-hold decay
+ * to raw instantaneous meter readings so VU bars and peak-dB readouts react fluidly.
+ */
+export function smoothVuMeterState(
+  prev: SmoothedMeterState,
+  target: MeterReading,
+  dtSec: number
+): SmoothedMeterState {
+  const dt = Math.max(0.001, Math.min(0.05, dtSec));
+
+  const targetL = Math.max(0, Math.min(1, target.left));
+  const targetR = Math.max(0, Math.min(1, target.right));
+
+  let nextL = expSmooth(
+    prev.left,
+    targetL,
+    dt,
+    targetL >= prev.left ? VU_ATTACK_TAU_S : VU_RELEASE_TAU_S
+  );
+  let nextR = expSmooth(
+    prev.right,
+    targetR,
+    dt,
+    targetR >= prev.right ? VU_ATTACK_TAU_S : VU_RELEASE_TAU_S
+  );
+  if (nextL < 0.0015 && targetL <= 0.0015) nextL = 0;
+  if (nextR < 0.0015 && targetR <= 0.0015) nextR = 0;
+
+  let peakHoldLeft = prev.peakHoldLeft;
+  let holdTimerLeft = prev.holdTimerLeft;
+  if (nextL >= peakHoldLeft) {
+    peakHoldLeft = nextL;
+    holdTimerLeft = PEAK_HOLD_DURATION_S;
+  } else if (holdTimerLeft > 0) {
+    holdTimerLeft = Math.max(0, holdTimerLeft - dt);
+  } else {
+    peakHoldLeft = expSmooth(peakHoldLeft, nextL, dt, PEAK_HOLD_RELEASE_TAU_S);
+    if (peakHoldLeft < 0.002 && nextL === 0) peakHoldLeft = 0;
+  }
+
+  let peakHoldRight = prev.peakHoldRight;
+  let holdTimerRight = prev.holdTimerRight;
+  if (nextR >= peakHoldRight) {
+    peakHoldRight = nextR;
+    holdTimerRight = PEAK_HOLD_DURATION_S;
+  } else if (holdTimerRight > 0) {
+    holdTimerRight = Math.max(0, holdTimerRight - dt);
+  } else {
+    peakHoldRight = expSmooth(peakHoldRight, nextR, dt, PEAK_HOLD_RELEASE_TAU_S);
+    if (peakHoldRight < 0.002 && nextR === 0) peakHoldRight = 0;
+  }
+
+  // Derive per-channel target peak dB while preserving exact meter.peakDb on the louder side
+  const maxNorm = Math.max(targetL, targetR);
+  const clampedPeakDb = Math.max(-60, Math.min(12, target.peakDb));
+  let targetDbL = -60;
+  let targetDbR = -60;
+  if (clampedPeakDb > -59.5 && maxNorm > 0.0005) {
+    targetDbL =
+      targetL <= 0.0005
+        ? -60
+        : targetL >= maxNorm - 0.001
+        ? clampedPeakDb
+        : Math.max(-60, clampedPeakDb - (maxNorm - targetL) * 66);
+    targetDbR =
+      targetR <= 0.0005
+        ? -60
+        : targetR >= maxNorm - 0.001
+        ? clampedPeakDb
+        : Math.max(-60, clampedPeakDb - (maxNorm - targetR) * 66);
+  }
+
+  const stepDb = (
+    curDb: number,
+    tgtDb: number,
+    curHold: number
+  ): { db: number; hold: number } => {
+    if (tgtDb > curDb) {
+      const next = expSmooth(curDb, tgtDb, dt, DB_ATTACK_TAU_S);
+      const nextHold = tgtDb - curDb > 0.6 ? DB_HOLD_DURATION_S : curHold;
+      return { db: next, hold: nextHold };
+    }
+    if (curHold > 0) {
+      return {
+        db: expSmooth(curDb, tgtDb, dt, DB_HOLD_DRIFT_TAU_S),
+        hold: Math.max(0, curHold - dt),
+      };
+    }
+    let next = expSmooth(curDb, tgtDb, dt, DB_RELEASE_TAU_S);
+    if (next <= -59.75 && tgtDb <= -59.5) next = -60;
+    return { db: next, hold: 0 };
+  };
+
+  const steppedL = stepDb(prev.peakDbLeft, targetDbL, prev.dbHoldTimerLeft);
+  const steppedR = stepDb(prev.peakDbRight, targetDbR, prev.dbHoldTimerRight);
+
+  return {
+    left: nextL,
+    right: nextR,
+    peakHoldLeft,
+    peakHoldRight,
+    holdTimerLeft,
+    holdTimerRight,
+    peakDb: Math.max(steppedL.db, steppedR.db),
+    peakDbLeft: steppedL.db,
+    peakDbRight: steppedR.db,
+    dbHoldTimerLeft: steppedL.hold,
+    dbHoldTimerRight: steppedR.hold,
+  };
+}
+
+function isMeterAtRest(s: SmoothedMeterState, target: MeterReading): boolean {
+  return (
+    s.left === 0 &&
+    s.right === 0 &&
+    s.peakHoldLeft === 0 &&
+    s.peakHoldRight === 0 &&
+    s.peakDb <= -59.95 &&
+    target.left <= 0.001 &&
+    target.right <= 0.001 &&
+    target.peakDb <= -59.5
+  );
+}
+
+function useSmoothedMeter(meter: MeterReading): SmoothedMeterState {
+  const [smoothed, setSmoothed] = useState<SmoothedMeterState>(INITIAL_SMOOTHED_METER);
+  const targetRef = useRef<MeterReading>(meter);
+  const stateRef = useRef<SmoothedMeterState>(INITIAL_SMOOTHED_METER);
+  const rafRef = useRef<number | null>(null);
+  const lastTimeRef = useRef<number | null>(null);
+
+  targetRef.current = meter;
+
+  useEffect(() => {
+    if (isMeterAtRest(stateRef.current, meter)) {
+      return;
+    }
+    if (rafRef.current !== null) return;
+
+    const tick = (now: number) => {
+      const dtSec = lastTimeRef.current !== null ? (now - lastTimeRef.current) / 1000 : 1 / 60;
+      lastTimeRef.current = now;
+
+      const prev = stateRef.current;
+      const next = smoothVuMeterState(prev, targetRef.current, dtSec);
+      stateRef.current = next;
+
+      const atRest = isMeterAtRest(next, targetRef.current);
+
+      if (
+        atRest ||
+        Math.abs(next.left - prev.left) > 0.0004 ||
+        Math.abs(next.right - prev.right) > 0.0004 ||
+        Math.abs(next.peakHoldLeft - prev.peakHoldLeft) > 0.0004 ||
+        Math.abs(next.peakHoldRight - prev.peakHoldRight) > 0.0004 ||
+        Math.abs(next.peakDbLeft - prev.peakDbLeft) > 0.02 ||
+        Math.abs(next.peakDbRight - prev.peakDbRight) > 0.02
+      ) {
+        setSmoothed(next);
+      }
+
+      if (atRest) {
+        rafRef.current = null;
+        lastTimeRef.current = null;
+        return;
+      }
+
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
+  }, [meter]);
+
+  useEffect(() => {
+    return () => {
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, []);
+
+  return smoothed;
 }
 
 export const ChannelStrip: React.FC<ChannelStripProps> = ({
@@ -108,6 +336,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
   const pluginFileRef = useRef<HTMLInputElement | null>(null);
   const panTrackRef = useRef<HTMLDivElement | null>(null);
   const panDragging = useRef(false);
+  const smoothedMeter = useSmoothedMeter(meter);
 
   const isMaster = channel.type === 'master';
   const isListen = channel.type === 'listen';
@@ -331,7 +560,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
               setShowSendMenu(false);
             }}
             title={`Input Source · ${asioConfig?.deviceType ?? 'ASIO'}: ${asioConfig?.activeDeviceName ?? 'ASIO4ALL v2'}`}
-            className="w-full h-[17px] px-1.5 rounded-[2px] bg-[#131926] hover:bg-[#1a2234] border border-white/10 hover:border-cyan-400/50 flex items-center justify-between gap-1 text-[9.5px] transition-colors"
+            className="w-full h-[17px] px-1.5 rounded-[2px] bg-[#131926] hover:bg-[#1a2234] border border-white/10 hover:border-[rgba(var(--theme-neon-rgb),0.55)] flex items-center justify-between gap-1 text-[9.5px] transition-colors"
           >
             <span className="flex items-center gap-1 min-w-0">
               <span
@@ -343,7 +572,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                     : channel.inputSource === 'bus'
                     ? 'bg-violet-400 shadow-[0_0_5px_#a78bfa]'
                     : channel.inputSource === 'demo'
-                    ? 'bg-cyan-400 shadow-[0_0_5px_#22d3ee]'
+                    ? 'bg-[var(--theme-neon)] shadow-[0_0_5px_var(--theme-neon)]'
                     : channel.inputSource === 'file'
                     ? 'bg-emerald-400 shadow-[0_0_5px_#34d399]'
                     : 'bg-slate-600'
@@ -475,7 +704,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
               {/* Cascaded Submenu Panel */}
               {activeInputSubmenu === 'hardware' && (
                 <div className="w-[215px] max-h-64 overflow-y-auto console-scroll bg-[#2a2e33] border border-[#454b52] rounded-[3px] shadow-[0_14px_32px_rgba(0,0,0,0.9)] py-1 -ml-[1px] text-[11px] text-[#e4e8ec]">
-                  <div className="px-2.5 py-1 text-[9.5px] font-semibold text-cyan-300 border-b border-white/10">
+                  <div className="px-2.5 py-1 text-[9.5px] font-semibold text-[var(--theme-neon-soft)] border-b border-white/10">
                     {asioConfig?.deviceType ?? 'ASIO'}: {asioConfig?.activeDeviceName ?? 'ASIO4ALL v2'}
                   </div>
 
@@ -528,7 +757,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                       >
                         <span className="truncate">{label}</span>
                         {channel.inputSource === 'mic' && channel.inputLabel === label && (
-                          <Check className="w-3 h-3 text-cyan-400 shrink-0" />
+                          <Check className="w-3 h-3 text-[var(--theme-neon)] shrink-0" />
                         )}
                       </button>
                     );
@@ -593,7 +822,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
 
               {activeInputSubmenu === 'internal' && (
                 <div className="w-[195px] bg-[#2a2e33] border border-[#454b52] rounded-[3px] shadow-[0_14px_32px_rgba(0,0,0,0.9)] py-1 -ml-[1px] text-[11px] text-[#e4e8ec]">
-                  <div className="px-2.5 py-1 text-[9.5px] font-semibold text-cyan-300 border-b border-white/10">
+                  <div className="px-2.5 py-1 text-[9.5px] font-semibold text-[var(--theme-neon-soft)] border-b border-white/10">
                     Internal Audio Source
                   </div>
                   <button
@@ -612,7 +841,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                       setShowInputMenu(false);
                       fileInputRef.current?.click();
                     }}
-                    className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left text-cyan-300 block"
+                    className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left text-[var(--theme-neon-soft)] block"
                   >
                     Load Audio File (.wav / .mp3)...
                   </button>
@@ -656,7 +885,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
       ) : (
         <div className="h-[22px] px-1.5 border-b border-[#1c2331] bg-[#0b0f17] flex items-center justify-between text-[9.5px] text-slate-500 shrink-0">
           <span>{isMaster ? 'Sum: All Bus' : isListen ? 'Solo / Cue' : 'Bus Input'}</span>
-          <span className="font-mono-tabular text-[9px] text-cyan-400/70">St</span>
+          <span className="font-mono-tabular text-[9px] text-[rgba(var(--theme-neon-rgb),0.75)]">St</span>
         </div>
       )}
 
@@ -675,7 +904,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 }));
               }}
               className={`p-0.5 rounded transition-colors ${
-                allInsertsEnabled ? 'text-cyan-400' : 'text-slate-500 hover:text-slate-300'
+                allInsertsEnabled ? 'text-[var(--theme-neon)]' : 'text-slate-500 hover:text-slate-300'
               }`}
             >
               <Power className="w-3 h-3" />
@@ -690,7 +919,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
               setShowInsertMenu((v) => !v);
               setShowSendMenu(false);
             }}
-            className="p-0.5 rounded text-slate-400 hover:text-cyan-300 hover:bg-white/5 transition-colors"
+            className="p-0.5 rounded text-slate-400 hover:text-[var(--theme-neon-soft)] hover:bg-white/5 transition-colors"
           >
             <Plus className="w-3.5 h-3.5" />
           </button>
@@ -700,7 +929,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
         {showInsertMenu && (
           <div
             onClick={(e) => e.stopPropagation()}
-            className="absolute top-[22px] left-0 w-[196px] z-40 bg-[#0b0f18] border border-cyan-500/45 rounded shadow-2xl p-1.5"
+            className="absolute top-[22px] left-0 w-[196px] z-40 bg-[#0b0f18] border border-[rgba(var(--theme-neon-rgb),0.45)] rounded shadow-2xl p-1.5"
           >
             {/* Format Tabs */}
             <div className="grid grid-cols-4 gap-1 mb-1.5">
@@ -711,7 +940,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                   onClick={() => setInsertFormatFilter(fmt)}
                   className={`py-0.5 rounded text-[9px] font-bold border transition-colors ${
                     insertFormatFilter === fmt
-                      ? 'bg-cyan-500/20 text-cyan-300 border-cyan-400/60'
+                      ? 'bg-[rgba(var(--theme-neon-rgb),0.2)] text-[var(--theme-neon-soft)] border-[rgba(var(--theme-neon-rgb),0.65)]'
                       : 'bg-[#121722] text-slate-400 border-white/10 hover:text-white'
                   }`}
                 >
@@ -728,7 +957,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                     key={`${item.format}-${item.name}`}
                     type="button"
                     onClick={() => addInsertPlugin(item)}
-                    className="w-full text-left px-1.5 py-1 text-[10px] text-slate-200 hover:bg-cyan-500/20 hover:text-cyan-200 rounded flex items-center justify-between gap-1.5"
+                    className="w-full text-left px-1.5 py-1 text-[10px] text-slate-200 hover:bg-[rgba(var(--theme-neon-rgb),0.2)] hover:text-[var(--theme-neon-soft)] rounded flex items-center justify-between gap-1.5"
                   >
                     <span className="truncate">{item.name}</span>
                     <span className={`px-1 rounded-[2px] text-[8px] font-bold border shrink-0 ${badge.cls}`}>
@@ -744,7 +973,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
               <button
                 type="button"
                 onClick={() => pluginFileRef.current?.click()}
-                className="w-full py-1 px-1.5 rounded bg-[#151c2b] hover:bg-cyan-500/20 border border-white/10 text-[9.5px] font-medium text-cyan-300 flex items-center justify-center gap-1"
+                className="w-full py-1 px-1.5 rounded bg-[#151c2b] hover:bg-[rgba(var(--theme-neon-rgb),0.2)] border border-white/10 text-[9.5px] font-medium text-[var(--theme-neon-soft)] flex items-center justify-center gap-1"
               >
                 <FilePlus2 className="w-3 h-3" />
                 Load .vst3 / .aax / .dll
@@ -777,7 +1006,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 }}
                 className={`group h-[21px] px-1 rounded-[2px] flex items-center justify-between gap-1 cursor-pointer border transition-all ${
                   plugin.enabled
-                    ? 'bg-[#1a2232] border-cyan-500/30 hover:border-cyan-400/70 text-slate-100'
+                    ? 'bg-[#1a2232] border-[rgba(var(--theme-neon-rgb),0.3)] hover:border-[rgba(var(--theme-neon-rgb),0.75)] text-slate-100'
                     : 'bg-[#121620] border-white/5 hover:border-white/15 text-slate-500'
                 }`}
               >
@@ -796,7 +1025,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                     }}
                     className={`shrink-0 transition-colors ${
                       plugin.enabled
-                        ? 'text-cyan-400 drop-shadow-[0_0_4px_rgba(34,211,238,0.7)]'
+                        ? 'text-[var(--theme-neon)] drop-shadow-[0_0_4px_rgba(var(--theme-neon-rgb),0.75)]'
                         : 'text-slate-600 hover:text-slate-400'
                     }`}
                   >
@@ -838,7 +1067,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
               setShowInputMenu(false);
               setShowSendMenu(false);
             }}
-            className="w-full h-[21px] px-1.5 rounded-[3px] bg-[#191f2a] hover:bg-[#232b3a] border border-white/15 hover:border-cyan-400/50 flex items-center justify-between text-[9.5px] text-slate-300 transition-colors"
+            className="w-full h-[21px] px-1.5 rounded-[3px] bg-[#191f2a] hover:bg-[#232b3a] border border-white/15 hover:border-[rgba(var(--theme-neon-rgb),0.55)] flex items-center justify-between text-[9.5px] text-slate-300 transition-colors"
           >
             <span className="truncate mx-auto">- Empty -</span>
             <ChevronDown className="w-2.5 h-2.5 text-slate-400 shrink-0" />
@@ -862,7 +1091,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                   }));
                 }}
                 className={`p-0.5 rounded transition-colors ${
-                  allSendsEnabled ? 'text-cyan-400' : 'text-slate-500 hover:text-slate-300'
+                  allSendsEnabled ? 'text-[var(--theme-neon)]' : 'text-slate-500 hover:text-slate-300'
                 }`}
               >
                 <Power className="w-3 h-3" />
@@ -877,7 +1106,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 setShowSendMenu((v) => !v);
                 setShowInsertMenu(false);
               }}
-              className="p-0.5 rounded text-slate-400 hover:text-cyan-300 hover:bg-white/5 transition-colors"
+              className="p-0.5 rounded text-slate-400 hover:text-[var(--theme-neon-soft)] hover:bg-white/5 transition-colors"
             >
               <Plus className="w-3.5 h-3.5" />
             </button>
@@ -913,7 +1142,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                   onClick={(e) => e.stopPropagation()}
                   className={`px-1 py-1 rounded-[2px] border transition-colors ${
                     send.enabled
-                      ? 'bg-[#192130] border-cyan-500/30'
+                      ? 'bg-[#192130] border-[rgba(var(--theme-neon-rgb),0.3)]'
                       : 'bg-[#121620] border-white/5 opacity-75'
                   }`}
                 >
@@ -931,7 +1160,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                         }
                         className={`shrink-0 ${
                           send.enabled
-                            ? 'text-cyan-400 drop-shadow-[0_0_4px_rgba(34,211,238,0.7)]'
+                            ? 'text-[var(--theme-neon)] drop-shadow-[0_0_4px_rgba(var(--theme-neon-rgb),0.75)]'
                             : 'text-slate-600'
                         }`}
                       >
@@ -960,9 +1189,9 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                         ),
                       }));
                     }}
-                    className="w-full h-1 bg-[#080a0f] rounded-full appearance-none cursor-pointer accent-cyan-400"
+                    className="w-full h-1 bg-[#080a0f] rounded-full appearance-none cursor-pointer accent-[var(--theme-neon)]"
                     style={{
-                      background: `linear-gradient(to right, #00e5ff ${sendNorm * 100}%, #111622 ${sendNorm * 100}%)`,
+                      background: `linear-gradient(to right, var(--theme-neon) ${sendNorm * 100}%, #111622 ${sendNorm * 100}%)`,
                     }}
                   />
                 </div>
@@ -975,18 +1204,20 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
           <span className="text-[9.5px] font-medium text-slate-500">
             {isMaster ? 'Stereo Master Out' : 'Cue Monitor Bus'}
           </span>
-          <span className="text-[9px] font-mono-tabular text-cyan-400/70 mt-1">Out 1-2</span>
+          <span className="text-[9px] font-mono-tabular text-[rgba(var(--theme-neon-rgb),0.75)] mt-1">
+            Out 1-2
+          </span>
         </div>
       )}
 
       {/* Section 4: Pan Slider OR Dual -∞ Readout */}
       {isMaster || isListen ? (
         <div className="px-1.5 py-2 border-b border-[#1c2331] grid grid-cols-2 gap-1">
-          <div className="h-5 bg-[#080a10] border border-white/10 rounded-[2px] flex items-center justify-center text-[10px] font-mono-tabular text-cyan-300">
-            {meter.peakDb <= -59 ? '-∞' : meter.peakDb.toFixed(1)}
+          <div className="h-5 bg-[#080a10] border border-white/10 rounded-[2px] flex items-center justify-center text-[10px] font-mono-tabular text-[var(--theme-neon-soft)]">
+            {smoothedMeter.peakDbLeft <= -59 ? '-∞' : smoothedMeter.peakDbLeft.toFixed(1)}
           </div>
-          <div className="h-5 bg-[#080a10] border border-white/10 rounded-[2px] flex items-center justify-center text-[10px] font-mono-tabular text-cyan-300">
-            {meter.peakDb <= -59 ? '-∞' : meter.peakDb.toFixed(1)}
+          <div className="h-5 bg-[#080a10] border border-white/10 rounded-[2px] flex items-center justify-center text-[10px] font-mono-tabular text-[var(--theme-neon-soft)]">
+            {smoothedMeter.peakDbRight <= -59 ? '-∞' : smoothedMeter.peakDbRight.toFixed(1)}
           </div>
         </div>
       ) : (
@@ -1096,8 +1327,8 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
               }}
               className={`h-[19px] rounded-[2px] flex items-center justify-center border transition-all ${
                 channel.monitor
-                  ? 'bg-cyan-500/25 text-cyan-300 border-cyan-400/70 shadow-[0_0_8px_rgba(34,211,238,0.45)]'
-                  : 'bg-[#151a25] text-slate-400 border-white/10 hover:text-slate-200'
+                  ? 'bg-[rgba(var(--theme-neon-rgb),0.25)] text-[var(--theme-neon-soft)] border-[rgba(var(--theme-neon-rgb),0.85)] shadow-[0_0_10px_rgba(var(--theme-neon-rgb),0.75)]'
+                  : 'bg-[#151a25] text-slate-400 border-white/10 hover:text-[var(--theme-neon-soft)] hover:border-[rgba(var(--theme-neon-rgb),0.5)]'
               }`}
             >
               <Volume2 className="w-3 h-3" />
@@ -1114,7 +1345,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
             }}
             className={`w-full h-[19px] rounded-[2px] text-[10px] font-medium border transition-all ${
               channel.stereoMode
-                ? 'bg-[#162235] text-sky-300 border-sky-500/40'
+                ? 'bg-[rgba(234,255,0,0.14)] text-[#f7ff6b] border-[rgba(234,255,0,0.45)]'
                 : 'bg-[#151a25] text-slate-400 border-white/10'
             }`}
           >
@@ -1130,7 +1361,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 e.stopPropagation();
                 onUpdate((c) => ({ ...c, stereoMode: !c.stereoMode }));
               }}
-              className="h-[19px] rounded-[2px] bg-[#162235] border border-cyan-500/30 text-[9.5px] text-cyan-300 font-medium flex items-center justify-center"
+              className="h-[19px] rounded-[2px] bg-[rgba(234,255,0,0.14)] border border-[rgba(234,255,0,0.4)] text-[9.5px] text-[#f7ff6b] font-medium flex items-center justify-center"
             >
               {channel.stereoMode ? 'Stereo' : 'Mono'}
             </button>
@@ -1160,8 +1391,10 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
 
         <div className="flex items-center justify-between gap-1 my-auto">
           <PeakMeter
-            left={meter.left}
-            right={meter.right}
+            left={smoothedMeter.left}
+            right={smoothedMeter.right}
+            peakHoldLeft={smoothedMeter.peakHoldLeft}
+            peakHoldRight={smoothedMeter.peakHoldRight}
             clipped={meter.clipped}
             neonColor={channel.neonAccent}
             onResetClip={onResetClip}
@@ -1184,7 +1417,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 e.stopPropagation();
                 cycleInputSource();
               }}
-              className="flex-1 h-[17px] px-1 rounded-[2px] bg-[#131824] border border-white/10 hover:border-cyan-400/50 text-[9px] text-slate-300 flex items-center justify-center gap-1 truncate"
+              className="flex-1 h-[17px] px-1 rounded-[2px] bg-[#131824] border border-white/10 hover:border-[rgba(var(--theme-neon-rgb),0.55)] text-[9px] text-slate-300 flex items-center justify-center gap-1 truncate"
             >
               {channel.inputSource === 'mic' ? (
                 <>
@@ -1202,7 +1435,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 </>
               ) : channel.inputSource === 'demo' ? (
                 <>
-                  <Radio className="w-2.5 h-2.5 text-cyan-400 shrink-0" />
+                  <Radio className="w-2.5 h-2.5 text-[var(--theme-neon)] shrink-0" />
                   <span>Stem</span>
                 </>
               ) : (
@@ -1216,7 +1449,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 e.stopPropagation();
                 fileInputRef.current?.click();
               }}
-              className="h-[17px] w-[18px] rounded-[2px] bg-[#131824] border border-white/10 hover:border-cyan-400/50 text-slate-400 hover:text-cyan-300 flex items-center justify-center shrink-0"
+              className="h-[17px] w-[18px] rounded-[2px] bg-[#131824] border border-white/10 hover:border-[rgba(var(--theme-neon-rgb),0.55)] text-slate-400 hover:text-[var(--theme-neon-soft)] flex items-center justify-center shrink-0"
             >
               <FolderOpen className="w-2.5 h-2.5" />
             </button>
@@ -1241,7 +1474,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
             e.stopPropagation();
             cycleAutomation();
           }}
-          className="w-full h-[18px] mt-1 rounded-[2px] bg-[#121620] border border-white/10 hover:border-cyan-500/40 text-[9.5px] font-medium text-slate-300 flex items-center justify-center"
+          className="w-full h-[18px] mt-1 rounded-[2px] bg-[#121620] border border-white/10 hover:border-[rgba(var(--theme-neon-rgb),0.45)] text-[9.5px] font-medium text-slate-300 flex items-center justify-center"
         >
           Auto:{' '}
           <span
@@ -1261,7 +1494,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
       {/* Section 7: Channel Index & Waveform/FX */}
       <div className="h-[22px] px-2 flex items-center justify-between border-t border-[#1c2331] bg-[#0b0e15] text-[10.5px] font-mono-tabular text-slate-300 shrink-0">
         <span>{isMaster || isListen ? '' : channel.index}</span>
-        {isAudio && <AudioWaveform className="w-3.5 h-3.5 text-cyan-400/80" />}
+        {isAudio && <AudioWaveform className="w-3.5 h-3.5 text-[rgba(var(--theme-neon-rgb),0.8)]" />}
         {isFx && <span className="text-[10px] font-sans font-bold text-amber-400">FX</span>}
       </div>
 
@@ -1273,10 +1506,10 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
           setEditingName(true);
         }}
         title="Double-click to name or rename channel"
-        className="h-[22px] px-1 flex items-center justify-center shrink-0 cursor-text"
+        className="h-[22px] px-1 flex items-center justify-center shrink-0 cursor-text backdrop-blur-[2px] border-t border-[#eaff00]/75"
         style={{
-          backgroundColor: channel.stripColor,
-          boxShadow: `0 -1px 10px ${channel.neonAccent}44`,
+          backgroundColor: 'rgba(234, 255, 0, 0.28)',
+          boxShadow: '0 -1px 12px rgba(234, 255, 0, 0.3)',
         }}
       >
         {editingName ? (
@@ -1293,7 +1526,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
             className="w-full bg-black/40 text-white text-[10px] font-bold text-center outline-none rounded px-1"
           />
         ) : (
-          <span className="text-[10.5px] font-bold tracking-wide text-slate-950 truncate">
+          <span className="text-[10.5px] font-bold tracking-wide text-white drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)] truncate">
             {channel.name}
           </span>
         )}

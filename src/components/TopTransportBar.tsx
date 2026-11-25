@@ -4,9 +4,10 @@ import {
   Cpu,
   Download,
   Monitor,
+  Palette,
   Zap,
 } from 'lucide-react';
-import { AsioDriverConfig } from '../types/mixer';
+import { AsioDriverConfig, ThemePreset } from '../types/mixer';
 
 export interface CpuMonitorMetrics {
   cpuPercent: number;
@@ -19,6 +20,8 @@ interface TopTransportBarProps {
   asioConfig: AsioDriverConfig;
   cpuMetrics: CpuMonitorMetrics;
   recordedAudioUrl: string | null;
+  activeTheme: ThemePreset;
+  onOpenThemeModal: () => void;
   onOpenAsioModal: () => void;
   onOpenDesktopModal: () => void;
   isDesktopInstallable: boolean;
@@ -29,6 +32,8 @@ export const TopTransportBar: React.FC<TopTransportBarProps> = ({
   asioConfig,
   cpuMetrics,
   recordedAudioUrl,
+  activeTheme,
+  onOpenThemeModal,
   onOpenAsioModal,
   onOpenDesktopModal,
   isDesktopInstallable,
@@ -44,15 +49,18 @@ export const TopTransportBar: React.FC<TopTransportBarProps> = ({
       : '#10b981';
 
   return (
-    <header className="h-[46px] px-3 bg-[#0b0e15] border-b border-[#1d2534] flex items-center justify-between gap-4 shrink-0 select-none">
+    <header
+      className="h-[46px] px-3 border-b border-[#1d2534] flex items-center justify-between gap-4 shrink-0 select-none"
+      style={{ backgroundColor: 'var(--theme-bg-panel)' }}
+    >
       {/* Left: Brand */}
       <div className="flex items-center shrink-0">
         <span className="text-sm font-bold tracking-wider text-white whitespace-nowrap">
-          GoVi<span className="text-cyan-400">Mix</span>
+          GoVi<span className="text-[var(--theme-neon)]">Mix</span>
         </span>
       </div>
 
-      {/* Right: Recorded Take Download + PC / .EXE + Low Latency ASIO + CPU Monitor */}
+      {/* Right: Recorded Take Download + Theme Settings + PC / .EXE + Low Latency ASIO + CPU Monitor */}
       <div className="flex items-center gap-2 shrink-0 relative">
         {recordedAudioUrl && (
           <a
@@ -67,6 +75,23 @@ export const TopTransportBar: React.FC<TopTransportBarProps> = ({
 
         <button
           type="button"
+          onClick={onOpenThemeModal}
+          title={`Pengaturan Tema: ${activeTheme.name}`}
+          className="px-2.5 py-1.5 rounded bg-[#121826] hover:bg-[#1a2234] border border-[rgba(var(--theme-neon-rgb),0.4)] text-[11px] font-semibold text-slate-200 flex items-center gap-1.5 whitespace-nowrap transition-all"
+        >
+          <Palette className="w-3.5 h-3.5 text-[var(--theme-neon)]" />
+          <span>Tema</span>
+          <span
+            className="w-2.5 h-2.5 rounded-full border border-white/30"
+            style={{
+              backgroundColor: activeTheme.neon,
+              boxShadow: `0 0 6px ${activeTheme.neon}`,
+            }}
+          />
+        </button>
+
+        <button
+          type="button"
           onClick={onOpenDesktopModal}
           title="Install GoViMix ke PC Windows atau Build .EXE"
           className={`px-2.5 py-1.5 rounded border text-[11px] font-semibold flex items-center gap-1.5 whitespace-nowrap transition-colors ${
@@ -75,7 +100,7 @@ export const TopTransportBar: React.FC<TopTransportBarProps> = ({
               : 'bg-[#121826] hover:bg-[#1a2234] border-white/15 text-slate-200'
           }`}
         >
-          <Monitor className="w-3.5 h-3.5 text-cyan-400" />
+          <Monitor className="w-3.5 h-3.5 text-[var(--theme-neon)]" />
           <span>{isElectronDesktop ? 'WIN .EXE' : 'PC / .EXE'}</span>
         </button>
 
@@ -83,10 +108,10 @@ export const TopTransportBar: React.FC<TopTransportBarProps> = ({
           type="button"
           onClick={onOpenAsioModal}
           title="Low Latency Priority Active · Click to configure ASIO & Audio/MIDI"
-          className="px-2.5 py-1.5 rounded bg-[#121826] hover:bg-[#1a2234] border border-cyan-500/40 text-xs flex items-center gap-1.5 whitespace-nowrap transition-all shadow-[0_0_12px_rgba(0,229,255,0.12)]"
+          className="px-2.5 py-1.5 rounded bg-[#121826] hover:bg-[#1a2234] border border-[rgba(var(--theme-neon-rgb),0.45)] text-xs flex items-center gap-1.5 whitespace-nowrap transition-all shadow-[0_0_12px_rgba(var(--theme-neon-rgb),0.14)]"
         >
-          <Zap className="w-3.5 h-3.5 text-emerald-400" />
-          <span className="font-semibold text-cyan-300">ASIO</span>
+          <Zap className="w-3.5 h-3.5 text-[var(--theme-neon)]" />
+          <span className="font-semibold text-[var(--theme-neon-soft)]">ASIO</span>
           <span className="text-[10px] font-semibold text-emerald-300 bg-emerald-500/15 px-1 rounded">
             LOW LAT
           </span>
@@ -102,7 +127,7 @@ export const TopTransportBar: React.FC<TopTransportBarProps> = ({
           title="Audio DSP CPU Monitor"
           className="px-2.5 py-1.5 rounded bg-[#0c1018] hover:bg-[#141a26] border border-white/15 flex items-center gap-2 whitespace-nowrap transition-colors"
         >
-          <Activity className="w-3.5 h-3.5 text-cyan-400" />
+          <Activity className="w-3.5 h-3.5 text-[var(--theme-neon)]" />
           <span className="text-[10.5px] font-semibold text-slate-300">CPU</span>
           <div className="w-12 h-2 rounded-sm bg-[#1a202c] overflow-hidden border border-white/10">
             <div
@@ -122,10 +147,10 @@ export const TopTransportBar: React.FC<TopTransportBarProps> = ({
         </button>
 
         {showCpuDetails && (
-          <div className="absolute right-0 top-[42px] z-50 w-64 rounded-md bg-[#0f141e] border border-cyan-500/40 shadow-[0_16px_40px_rgba(0,0,0,0.85)] p-3 text-xs space-y-2">
+          <div className="absolute right-0 top-[42px] z-50 w-64 rounded-md bg-[#0f141e] border border-[rgba(var(--theme-neon-rgb),0.45)] shadow-[0_16px_40px_rgba(0,0,0,0.85)] p-3 text-xs space-y-2">
             <div className="flex items-center justify-between border-b border-white/10 pb-1.5">
               <span className="font-semibold text-white flex items-center gap-1.5">
-                <Cpu className="w-3.5 h-3.5 text-cyan-400" />
+                <Cpu className="w-3.5 h-3.5 text-[var(--theme-neon)]" />
                 DSP &amp; CPU Monitor
               </span>
               <span className="text-[10px] font-semibold text-emerald-300">Low-Latency Mode</span>
@@ -136,7 +161,7 @@ export const TopTransportBar: React.FC<TopTransportBarProps> = ({
                 {cpuMetrics.cpuPercent}%
               </span>
               <span className="text-slate-400">Round-Trip Latency</span>
-              <span className="text-right font-mono-tabular text-cyan-300">
+              <span className="text-right font-mono-tabular text-[var(--theme-neon-soft)]">
                 {cpuMetrics.roundTripMs} ms
               </span>
               <span className="text-slate-400">Active Inserts</span>
