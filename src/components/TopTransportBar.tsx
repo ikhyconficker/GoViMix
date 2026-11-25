@@ -62,6 +62,7 @@ export const TopTransportBar: React.FC<TopTransportBarProps> = ({
 
       {/* Right: Recorded Take Download + Theme Settings + PC / .EXE + Low Latency ASIO + CPU Monitor */}
       <div className="flex items-center gap-2 shrink-0 relative">
+
         {recordedAudioUrl && (
           <a
             href={recordedAudioUrl}

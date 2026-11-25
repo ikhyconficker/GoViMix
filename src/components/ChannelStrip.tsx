@@ -16,6 +16,11 @@ import {
 } from 'lucide-react';
 import { BUILTIN_SEND_BUSES, PLUGIN_CATALOG } from '../data/defaultSession';
 import {
+  inferMicChannelMode,
+  isStereoVirtualInputLabel,
+  matchHardwareDeviceForChannelLabel,
+} from '../utils/audioDeviceMatch';
+import {
   AsioDriverConfig,
   AudioDeviceInfo,
   AutomationMode,
@@ -23,6 +28,8 @@ import {
   InputSourceType,
   InsertPlugin,
   MeterReading,
+  MicChannelMode,
+  OutputTargetType,
   PluginCatalogItem,
   PluginFormat,
   PluginType,
@@ -37,6 +44,7 @@ interface ChannelStripProps {
   allChannels?: ChannelState[];
   asioConfig?: AsioDriverConfig;
   inputDevices?: AudioDeviceInfo[];
+  outputDevices?: AudioDeviceInfo[];
   isSelected: boolean;
   meter: MeterReading;
   canDelete?: boolean;
@@ -52,8 +60,16 @@ interface ChannelStripProps {
     source: InputSourceType,
     channelIndex: number,
     label: string,
-    deviceId?: string
+    deviceId?: string,
+    micMode?: MicChannelMode
   ) => void;
+  onSelectOutput?: (
+    channelId: string,
+    targetType: OutputTargetType,
+    targetId: string,
+    label: string
+  ) => void;
+  onScanOutputDevices?: () => Promise<void>;
 }
 
 const AUTO_MODES: AutomationMode[] = ['Off', 'Read', 'Touch', 'Latch', 'Write'];
@@ -311,6 +327,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
   allChannels = [],
   asioConfig,
   inputDevices = [],
+  outputDevices = [],
   isSelected,
   meter,
   canDelete = false,
@@ -322,16 +339,25 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
   onLoadFile,
   onToggleMic,
   onSelectInput,
+  onSelectOutput,
+  onScanOutputDevices,
 }) => {
   const [showInputMenu, setShowInputMenu] = useState(false);
   const [activeInputSubmenu, setActiveInputSubmenu] = useState<
-    'hardware' | 'bus' | 'internal' | 'application' | null
+    'hardware' | 'bus' | 'music' | null
   >('hardware');
+  const [scanningInputs, setScanningInputs] = useState(false);
+  const [showOutputMenu, setShowOutputMenu] = useState(false);
+  const [activeOutputSubmenu, setActiveOutputSubmenu] = useState<'bus' | 'hardware' | null>(
+    'hardware'
+  );
+  const [scanningOutputs, setScanningOutputs] = useState(false);
   const [showInsertMenu, setShowInsertMenu] = useState(false);
   const [insertFormatFilter, setInsertFormatFilter] = useState<'ALL' | PluginFormat>('ALL');
   const [showSendMenu, setShowSendMenu] = useState(false);
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState(channel.name);
+  const stripRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const pluginFileRef = useRef<HTMLInputElement | null>(null);
   const panTrackRef = useRef<HTMLDivElement | null>(null);
@@ -342,6 +368,42 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
   const isListen = channel.type === 'listen';
   const isFx = channel.type === 'fx';
   const isAudio = channel.type === 'audio';
+
+  useEffect(() => {
+    if (!showInputMenu && !showOutputMenu && !showInsertMenu && !showSendMenu) return;
+    const handleOutside = (e: MouseEvent) => {
+      if (stripRef.current && !stripRef.current.contains(e.target as Node)) {
+        setShowInputMenu(false);
+        setShowOutputMenu(false);
+        setShowInsertMenu(false);
+        setShowSendMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutside);
+    return () => document.removeEventListener('mousedown', handleOutside);
+  }, [showInputMenu, showOutputMenu, showInsertMenu, showSendMenu]);
+
+  const resolvedOutputType: OutputTargetType =
+    channel.outputTargetType ?? (isMaster || isListen ? 'hardware' : 'master');
+  const resolvedOutputId =
+    channel.outputTargetId ?? (isMaster || isListen ? 'default' : 'main-bus');
+  const resolvedOutputLabel = (() => {
+    if (resolvedOutputType === 'none') return 'None';
+    if (resolvedOutputType === 'master') return channel.outputLabel || 'Main';
+    if (resolvedOutputType === 'bus') return channel.outputLabel || 'Bus';
+    if (channel.outputLabel) return channel.outputLabel;
+    if (isMaster) return 'Out 1-2';
+    if (isListen) return 'Cue Out 1-2';
+    return 'Direct Out';
+  })();
+
+  const availableOutputBuses = allChannels.filter(
+    (c) =>
+      c.id !== channel.id &&
+      c.type !== 'master' &&
+      (c.type === 'fx' || c.type === 'listen' || (c.type === 'audio' && Boolean(c.name))) &&
+      c.outputTargetId !== channel.id
+  );
 
   const stripWidth = isMaster || isListen ? 'w-[104px]' : 'w-[100px]';
 
@@ -439,6 +501,26 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
     });
   };
 
+  const cycleMicChannelMode = () => {
+    const order: MicChannelMode[] = ['mono-lr', 'left', 'right', 'stereo'];
+    const cur = channel.micChannelMode ?? 'mono-lr';
+    const next = order[(order.indexOf(cur) + 1) % order.length];
+    onUpdate((c) => ({ ...c, micChannelMode: next }));
+  };
+
+  const micModeLabel = (mode?: MicChannelMode) => {
+    switch (mode ?? 'mono-lr') {
+      case 'left':
+        return 'L';
+      case 'right':
+        return 'R';
+      case 'stereo':
+        return 'St';
+      default:
+        return 'L+R';
+    }
+  };
+
   const allInsertsEnabled = channel.inserts.length > 0 && channel.inserts.some((i) => i.enabled);
   const allSendsEnabled = channel.sends.length > 0 && channel.sends.some((s) => s.enabled);
 
@@ -455,6 +537,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
 
   return (
     <div
+      ref={stripRef}
       onClick={onSelect}
       className={`group/strip relative flex flex-col shrink-0 h-full border-r border-[#1c2331] transition-colors select-none ${stripWidth}`}
       style={{
@@ -556,6 +639,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
               e.stopPropagation();
               setShowInputMenu((v) => !v);
               setActiveInputSubmenu('hardware');
+              setShowOutputMenu(false);
               setShowInsertMenu(false);
               setShowSendMenu(false);
             }}
@@ -583,13 +667,16 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                   const asioActiveInputs = asioConfig?.activeInputChannels ?? [];
                   const primaryAsioIn = asioActiveInputs[0] ?? `${asioConfig?.activeDeviceName ?? 'ASIO'} In ${channel.inputChannelIndex}`;
                   if (channel.inputSource === 'mic') {
+                    const matchedDev = channel.inputDeviceId
+                      ? inputDevices.find((d) => d.deviceId === channel.inputDeviceId)
+                      : undefined;
                     if (
                       !channel.inputLabel ||
                       channel.inputLabel.startsWith('ASIO In ')
                     ) {
-                      return asioActiveInputs.length > 0
+                      return matchedDev?.label ?? (asioActiveInputs.length > 0
                         ? primaryAsioIn
-                        : `${asioConfig?.activeDeviceName ?? 'ASIO'} ${channel.inputChannelIndex}`;
+                        : `${asioConfig?.activeDeviceName ?? 'ASIO'} ${channel.inputChannelIndex}`);
                     }
                     return channel.inputLabel;
                   }
@@ -666,36 +753,21 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
 
                 <button
                   type="button"
-                  onMouseEnter={() => setActiveInputSubmenu('internal')}
-                  onClick={() => setActiveInputSubmenu('internal')}
+                  onMouseEnter={() => setActiveInputSubmenu('music')}
+                  onClick={() => setActiveInputSubmenu('music')}
                   className={`w-full px-2.5 py-1.5 flex items-center justify-between text-left transition-colors ${
-                    activeInputSubmenu === 'internal' ? 'bg-[#3e444c]' : 'hover:bg-[#3e444c]'
+                    activeInputSubmenu === 'music' ? 'bg-[#3e444c]' : 'hover:bg-[#3e444c]'
                   }`}
                 >
                   <span className="flex items-center gap-2">
                     <span className="w-3.5 flex items-center justify-center shrink-0">
-                      {(channel.inputSource === 'demo' || channel.inputSource === 'file') && (
+                      {(channel.inputSource === 'demo' ||
+                        channel.inputSource === 'file' ||
+                        channel.inputSource === 'app') && (
                         <Check className="w-3.5 h-3.5 text-white" />
                       )}
                     </span>
-                    <span>Internal</span>
-                  </span>
-                  <ChevronRight className="w-3.5 h-3.5 text-slate-300" />
-                </button>
-
-                <button
-                  type="button"
-                  onMouseEnter={() => setActiveInputSubmenu('application')}
-                  onClick={() => setActiveInputSubmenu('application')}
-                  className={`w-full px-2.5 py-1.5 flex items-center justify-between text-left transition-colors ${
-                    activeInputSubmenu === 'application' ? 'bg-[#3e444c]' : 'hover:bg-[#3e444c]'
-                  }`}
-                >
-                  <span className="flex items-center gap-2">
-                    <span className="w-3.5 flex items-center justify-center shrink-0">
-                      {channel.inputSource === 'app' && <Check className="w-3.5 h-3.5 text-white" />}
-                    </span>
-                    <span>Application</span>
+                    <span>Musik (File / Tab)</span>
                   </span>
                   <ChevronRight className="w-3.5 h-3.5 text-slate-300" />
                 </button>
@@ -703,35 +775,81 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
 
               {/* Cascaded Submenu Panel */}
               {activeInputSubmenu === 'hardware' && (
-                <div className="w-[215px] max-h-64 overflow-y-auto console-scroll bg-[#2a2e33] border border-[#454b52] rounded-[3px] shadow-[0_14px_32px_rgba(0,0,0,0.9)] py-1 -ml-[1px] text-[11px] text-[#e4e8ec]">
+                <div className="w-[225px] max-h-64 overflow-y-auto console-scroll bg-[#2a2e33] border border-[#454b52] rounded-[3px] shadow-[0_14px_32px_rgba(0,0,0,0.9)] py-1 -ml-[1px] text-[11px] text-[#e4e8ec]">
                   <div className="px-2.5 py-1 text-[9.5px] font-semibold text-[var(--theme-neon-soft)] border-b border-white/10">
                     {asioConfig?.deviceType ?? 'ASIO'}: {asioConfig?.activeDeviceName ?? 'ASIO4ALL v2'}
                   </div>
 
-                  {(asioConfig?.activeInputChannels ?? ['HD Audio Mic input 1 + 2']).map(
-                    (asioChLabel, idx) => (
-                      <button
-                        key={asioChLabel}
-                        type="button"
-                        onClick={() => {
-                          onSelectInput?.(
-                            channel.id,
-                            'mic',
-                            idx + 1,
-                            asioChLabel,
-                            asioConfig?.inputDeviceId
-                          );
-                          setShowInputMenu(false);
-                        }}
-                        className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left flex items-center justify-between gap-2"
-                      >
-                        <span className="truncate">{asioChLabel}</span>
-                        {channel.inputSource === 'mic' &&
-                          (channel.inputLabel === asioChLabel || channel.inputChannelIndex === idx + 1) && (
+                  {/* Mic Channel Mode (Mono L+R / In L / In R / Stereo) */}
+                  <div className="px-2 py-1.5 border-b border-white/10 space-y-1">
+                    <div className="text-[9px] text-slate-400">Mode Channel (L / R)</div>
+                    <div className="grid grid-cols-4 gap-1">
+                      {(
+                        [
+                          { id: 'mono-lr', label: 'L+R' },
+                          { id: 'left', label: 'In L' },
+                          { id: 'right', label: 'In R' },
+                          { id: 'stereo', label: 'Stereo' },
+                        ] as const
+                      ).map((m) => {
+                        const active = (channel.micChannelMode ?? 'mono-lr') === m.id;
+                        return (
+                          <button
+                            key={m.id}
+                            type="button"
+                            onClick={() => onUpdate((c) => ({ ...c, micChannelMode: m.id }))}
+                            className={`py-0.5 rounded-[2px] text-[9.5px] font-semibold border transition-colors ${
+                              active
+                                ? 'bg-[rgba(var(--theme-neon-rgb),0.22)] text-[var(--theme-neon-soft)] border-[rgba(var(--theme-neon-rgb),0.7)]'
+                                : 'bg-[#1d2229] text-slate-300 border-white/10 hover:bg-[#3e444c]'
+                            }`}
+                          >
+                            {m.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {(asioConfig?.activeInputChannels ?? []).length === 0 ? (
+                    <div className="px-2.5 py-1.5 text-[10px] text-slate-400 italic">
+                      No active input enabled in ASIO Settings
+                    </div>
+                  ) : (
+                    (asioConfig?.activeInputChannels ?? []).map((asioChLabel, idx) => {
+                      const matchedDev = matchHardwareDeviceForChannelLabel(
+                        asioChLabel,
+                        inputDevices,
+                        'audioinput'
+                      );
+                      const isVirtual = isStereoVirtualInputLabel(asioChLabel);
+                      const resolvedDevId = isVirtual
+                        ? matchedDev?.deviceId
+                        : matchedDev?.deviceId ?? asioConfig?.inputDeviceId;
+                      return (
+                        <button
+                          key={asioChLabel}
+                          type="button"
+                          onClick={() => {
+                            onSelectInput?.(
+                              channel.id,
+                              'mic',
+                              idx + 1,
+                              asioChLabel,
+                              resolvedDevId,
+                              inferMicChannelMode(asioChLabel)
+                            );
+                            setShowInputMenu(false);
+                          }}
+                          className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left flex items-center justify-between gap-2"
+                        >
+                          <span className="truncate">{asioChLabel}</span>
+                          {channel.inputSource === 'mic' && channel.inputLabel === asioChLabel && (
                             <Check className="w-3 h-3 text-emerald-400 shrink-0" />
                           )}
-                      </button>
-                    )
+                        </button>
+                      );
+                    })
                   )}
 
                   <div className="px-2.5 pt-1.5 pb-0.5 text-[9px] text-slate-400 border-t border-white/10 mt-1">
@@ -749,7 +867,8 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                             'mic',
                             inIdx,
                             label,
-                            asioConfig?.inputDeviceId
+                            asioConfig?.inputDeviceId,
+                            'mono-lr'
                           );
                           setShowInputMenu(false);
                         }}
@@ -778,16 +897,40 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                               'mic',
                               channel.inputChannelIndex || channel.index,
                               dev.label,
-                              dev.deviceId
+                              dev.deviceId,
+                              inferMicChannelMode(dev.label)
                             );
                             setShowInputMenu(false);
                           }}
-                          className="w-full px-2.5 py-1 hover:bg-[#3e444c] text-left truncate block"
+                          className="w-full px-2.5 py-1 hover:bg-[#3e444c] text-left flex items-center justify-between gap-2"
                         >
-                          {dev.label}
+                          <span className="truncate">{dev.label}</span>
+                          {channel.inputSource === 'mic' && channel.inputDeviceId === dev.deviceId && (
+                            <Check className="w-3 h-3 text-emerald-400 shrink-0" />
+                          )}
                         </button>
                       ))}
                     </>
+                  )}
+
+                  {onScanOutputDevices && (
+                    <div className="pt-1 mt-1 px-2 border-t border-white/10">
+                      <button
+                        type="button"
+                        disabled={scanningInputs}
+                        onClick={async () => {
+                          setScanningInputs(true);
+                          try {
+                            await onScanOutputDevices();
+                          } finally {
+                            setScanningInputs(false);
+                          }
+                        }}
+                        className="w-full py-1 px-2 rounded bg-[#1d2229] hover:bg-[#3e444c] text-[10px] text-[var(--theme-neon-soft)] text-center transition-colors"
+                      >
+                        {scanningInputs ? 'Memindai input...' : 'Scan Perangkat Input (VC / Mic)'}
+                      </button>
+                    </div>
                   )}
                 </div>
               )}
@@ -820,11 +963,41 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 </div>
               )}
 
-              {activeInputSubmenu === 'internal' && (
-                <div className="w-[195px] bg-[#2a2e33] border border-[#454b52] rounded-[3px] shadow-[0_14px_32px_rgba(0,0,0,0.9)] py-1 -ml-[1px] text-[11px] text-[#e4e8ec]">
+              {activeInputSubmenu === 'music' && (
+                <div className="w-[225px] bg-[#2a2e33] border border-[#454b52] rounded-[3px] shadow-[0_14px_32px_rgba(0,0,0,0.9)] py-1 -ml-[1px] text-[11px] text-[#e4e8ec]">
                   <div className="px-2.5 py-1 text-[9.5px] font-semibold text-[var(--theme-neon-soft)] border-b border-white/10">
-                    Internal Audio Source
+                    Sumber Musik Sederhana
                   </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowInputMenu(false);
+                      fileInputRef.current?.click();
+                    }}
+                    className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left text-emerald-300 font-medium block"
+                  >
+                    Pilih File Musik (.mp3 / .wav)...
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onSelectInput?.(
+                        channel.id,
+                        'app',
+                        channel.index,
+                        'Audio Tab / Layar',
+                        'app-capture',
+                        'stereo'
+                      );
+                      setShowInputMenu(false);
+                    }}
+                    className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left flex items-center justify-between gap-1"
+                  >
+                    <span className="truncate">Audio Tab / Layar (Chrome/Edge)</span>
+                    {channel.inputSource === 'app' && (
+                      <Check className="w-3 h-3 text-amber-300 shrink-0" />
+                    )}
+                  </button>
                   <button
                     type="button"
                     onClick={() => {
@@ -835,48 +1008,6 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                   >
                     Demo Stem (Synth)
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setShowInputMenu(false);
-                      fileInputRef.current?.click();
-                    }}
-                    className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left text-[var(--theme-neon-soft)] block"
-                  >
-                    Load Audio File (.wav / .mp3)...
-                  </button>
-                </div>
-              )}
-
-              {activeInputSubmenu === 'application' && (
-                <div className="w-[190px] bg-[#2a2e33] border border-[#454b52] rounded-[3px] shadow-[0_14px_32px_rgba(0,0,0,0.9)] py-1 -ml-[1px] text-[11.5px] text-[#e4e8ec]">
-                  {[
-                    { name: 'Firefox', devId: 'app-firefox' },
-                    { name: 'svchost.exe', devId: 'app-svchost' },
-                    { name: 'Chrome / Browser Audio', devId: 'app-capture' },
-                    { name: 'Capture App / System Audio...', devId: 'app-capture' },
-                  ].map((appItem) => (
-                    <button
-                      key={appItem.name}
-                      type="button"
-                      onClick={() => {
-                        onSelectInput?.(
-                          channel.id,
-                          'app',
-                          channel.index,
-                          appItem.name,
-                          appItem.devId
-                        );
-                        setShowInputMenu(false);
-                      }}
-                      className="w-full px-3 py-1.5 hover:bg-[#3e444c] text-left flex items-center justify-between gap-1 transition-colors"
-                    >
-                      <span className="truncate">{appItem.name}</span>
-                      {channel.inputSource === 'app' && channel.inputLabel === appItem.name && (
-                        <Check className="w-3 h-3 text-amber-300 shrink-0" />
-                      )}
-                    </button>
-                  ))}
                 </div>
               )}
             </div>
@@ -890,7 +1021,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
       )}
 
       {/* Section 2: Inserts Rack (VST3 / AAX / VST2) */}
-      <div className="relative flex flex-col h-[142px] border-b border-[#1c2331]">
+      <div className="relative flex flex-col h-[132px] border-b border-[#1c2331]">
         <div className="h-[22px] px-1.5 flex items-center justify-between bg-[#131823] border-b border-[#1c2331] shrink-0">
           <div className="flex items-center gap-1">
             <button
@@ -917,6 +1048,8 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
             onClick={(e) => {
               e.stopPropagation();
               setShowInsertMenu((v) => !v);
+              setShowInputMenu(false);
+              setShowOutputMenu(false);
               setShowSendMenu(false);
             }}
             className="p-0.5 rounded text-slate-400 hover:text-[var(--theme-neon-soft)] hover:bg-white/5 transition-colors"
@@ -1065,6 +1198,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
               e.stopPropagation();
               setShowInsertMenu((v) => !v);
               setShowInputMenu(false);
+              setShowOutputMenu(false);
               setShowSendMenu(false);
             }}
             className="w-full h-[21px] px-1.5 rounded-[3px] bg-[#191f2a] hover:bg-[#232b3a] border border-white/15 hover:border-[rgba(var(--theme-neon-rgb),0.55)] flex items-center justify-between text-[9.5px] text-slate-300 transition-colors"
@@ -1077,7 +1211,7 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
 
       {/* Section 3: Sends Rack */}
       {!isMaster && !isListen ? (
-        <div className="relative flex flex-col h-[106px] border-b border-[#1c2331]">
+        <div className="relative flex flex-col h-[92px] border-b border-[#1c2331]">
           <div className="h-[22px] px-1.5 flex items-center justify-between bg-[#131823] border-b border-[#1c2331] shrink-0">
             <div className="flex items-center gap-1">
               <button
@@ -1105,6 +1239,8 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 e.stopPropagation();
                 setShowSendMenu((v) => !v);
                 setShowInsertMenu(false);
+                setShowInputMenu(false);
+                setShowOutputMenu(false);
               }}
               className="p-0.5 rounded text-slate-400 hover:text-[var(--theme-neon-soft)] hover:bg-white/5 transition-colors"
             >
@@ -1200,15 +1336,266 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
           </div>
         </div>
       ) : (
-        <div className="h-[106px] border-b border-[#1c2331] bg-[#0a0d14]/40 flex flex-col items-center justify-center px-2 text-center">
+        <div className="h-[92px] border-b border-[#1c2331] bg-[#0a0d14]/40 flex flex-col items-center justify-center px-2 text-center">
           <span className="text-[9.5px] font-medium text-slate-500">
             {isMaster ? 'Stereo Master Out' : 'Cue Monitor Bus'}
           </span>
-          <span className="text-[9px] font-mono-tabular text-[rgba(var(--theme-neon-rgb),0.75)] mt-1">
-            Out 1-2
+          <span className="text-[9px] font-mono-tabular text-[rgba(var(--theme-neon-rgb),0.75)] mt-1 truncate max-w-full">
+            {resolvedOutputLabel}
           </span>
         </div>
       )}
+
+      {/* Section 3b: Per-Channel Output Routing Row */}
+      <div className="relative h-[24px] px-1 border-b border-[#1c2331] bg-[#0b0f17] flex items-center shrink-0">
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setShowOutputMenu((v) => !v);
+            setActiveOutputSubmenu('hardware');
+            setShowInputMenu(false);
+            setShowInsertMenu(false);
+            setShowSendMenu(false);
+          }}
+          title={`Output: ${resolvedOutputLabel}`}
+          className="w-full h-[18px] px-1.5 rounded-[2px] bg-[#131926] hover:bg-[#1a2234] border border-white/10 hover:border-[rgba(var(--theme-neon-rgb),0.55)] flex items-center justify-between gap-1 text-[9.5px] transition-colors"
+        >
+          <span className="flex items-center gap-1 min-w-0">
+            <span
+              className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                resolvedOutputType === 'hardware'
+                  ? 'bg-emerald-400 shadow-[0_0_5px_#34d399]'
+                  : resolvedOutputType === 'bus'
+                  ? 'bg-violet-400 shadow-[0_0_5px_#a78bfa]'
+                  : resolvedOutputType === 'master'
+                  ? 'bg-[var(--theme-neon)] shadow-[0_0_5px_var(--theme-neon)]'
+                  : 'bg-slate-600'
+              }`}
+            />
+            <span className="text-[8.5px] text-slate-500 shrink-0">Out</span>
+            <span className="truncate text-slate-200 font-medium">{resolvedOutputLabel}</span>
+          </span>
+          <ChevronDown className="w-2.5 h-2.5 text-slate-400 shrink-0" />
+        </button>
+
+        {showOutputMenu && (
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className={`absolute top-[24px] z-50 flex items-start ${
+              isMaster || isListen ? 'right-0 flex-row-reverse' : 'left-0'
+            }`}
+          >
+            {/* Primary Output Categories */}
+            <div className="w-[165px] bg-[#2a2e33] border border-[#454b52] rounded-[3px] shadow-[0_14px_32px_rgba(0,0,0,0.85)] py-1 text-[11.5px] text-[#e4e8ec]">
+              <div className="px-2.5 py-1 text-[9.5px] font-semibold text-slate-400 border-b border-white/10">
+                Channel Output
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  onSelectOutput?.(channel.id, 'none', 'none', 'None');
+                  setShowOutputMenu(false);
+                }}
+                className="w-full px-2.5 py-1.5 flex items-center gap-2 hover:bg-[#3e444c] text-left transition-colors"
+              >
+                <span className="w-3.5 flex items-center justify-center shrink-0">
+                  {resolvedOutputType === 'none' && <Check className="w-3.5 h-3.5 text-white" />}
+                </span>
+                <span>None</span>
+              </button>
+
+              {!isMaster && !isListen && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onSelectOutput?.(channel.id, 'master', 'main-bus', 'Main');
+                    setShowOutputMenu(false);
+                  }}
+                  className="w-full px-2.5 py-1.5 flex items-center gap-2 hover:bg-[#3e444c] text-left transition-colors"
+                >
+                  <span className="w-3.5 flex items-center justify-center shrink-0">
+                    {resolvedOutputType === 'master' && <Check className="w-3.5 h-3.5 text-[var(--theme-neon)]" />}
+                  </span>
+                  <span className="font-medium">Main</span>
+                </button>
+              )}
+
+              {!isMaster && (
+                <button
+                  type="button"
+                  onMouseEnter={() => setActiveOutputSubmenu('bus')}
+                  onClick={() => setActiveOutputSubmenu('bus')}
+                  className={`w-full px-2.5 py-1.5 flex items-center justify-between text-left transition-colors ${
+                    activeOutputSubmenu === 'bus' ? 'bg-[#3e444c]' : 'hover:bg-[#3e444c]'
+                  }`}
+                >
+                  <span className="flex items-center gap-2">
+                    <span className="w-3.5 flex items-center justify-center shrink-0">
+                      {resolvedOutputType === 'bus' && <Check className="w-3.5 h-3.5 text-violet-300" />}
+                    </span>
+                    <span>Bus</span>
+                  </span>
+                  <ChevronRight className="w-3.5 h-3.5 text-slate-300" />
+                </button>
+              )}
+
+              <button
+                type="button"
+                onMouseEnter={() => setActiveOutputSubmenu('hardware')}
+                onClick={() => setActiveOutputSubmenu('hardware')}
+                className={`w-full px-2.5 py-1.5 flex items-center justify-between text-left transition-colors ${
+                  activeOutputSubmenu === 'hardware' ? 'bg-[#3e444c]' : 'hover:bg-[#3e444c]'
+                }`}
+              >
+                <span className="flex items-center gap-2">
+                  <span className="w-3.5 flex items-center justify-center shrink-0">
+                    {resolvedOutputType === 'hardware' && <Check className="w-3.5 h-3.5 text-emerald-400" />}
+                  </span>
+                  <span>Hardware / ASIO</span>
+                </span>
+                <ChevronRight className="w-3.5 h-3.5 text-slate-300" />
+              </button>
+            </div>
+
+            {/* Submenu: Bus Routing */}
+            {activeOutputSubmenu === 'bus' && !isMaster && (
+              <div className="w-[185px] max-h-56 overflow-y-auto console-scroll bg-[#2a2e33] border border-[#454b52] rounded-[3px] shadow-[0_14px_32px_rgba(0,0,0,0.9)] py-1 -mx-[1px] text-[11px] text-[#e4e8ec]">
+                <div className="px-2.5 py-1 text-[9.5px] font-semibold text-violet-300 border-b border-white/10">
+                  Route Output to Bus
+                </div>
+                {availableOutputBuses.length === 0 ? (
+                  <div className="px-2.5 py-1.5 text-[10px] text-slate-400 italic">
+                    Tidak ada bus tersedia
+                  </div>
+                ) : (
+                  availableOutputBuses.map((bus) => {
+                    const busLabel = bus.name || `Ch ${bus.index}`;
+                    const selected = resolvedOutputType === 'bus' && resolvedOutputId === bus.id;
+                    return (
+                      <button
+                        key={bus.id}
+                        type="button"
+                        onClick={() => {
+                          onSelectOutput?.(channel.id, 'bus', bus.id, busLabel);
+                          setShowOutputMenu(false);
+                        }}
+                        className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left flex items-center justify-between gap-2"
+                      >
+                        <span className="truncate">{busLabel}</span>
+                        {selected && <Check className="w-3 h-3 text-violet-300 shrink-0" />}
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            )}
+
+            {/* Submenu: Hardware / ASIO Output */}
+            {activeOutputSubmenu === 'hardware' && (
+              <div className="w-[225px] max-h-64 overflow-y-auto console-scroll bg-[#2a2e33] border border-[#454b52] rounded-[3px] shadow-[0_14px_32px_rgba(0,0,0,0.9)] py-1 -mx-[1px] text-[11px] text-[#e4e8ec]">
+                <div className="px-2.5 py-1 text-[9.5px] font-semibold text-emerald-300 border-b border-white/10">
+                  {asioConfig?.deviceType ?? 'ASIO'}: {asioConfig?.activeDeviceName ?? 'ASIO4ALL v2'}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    const defLabel = isMaster ? 'Out 1-2' : isListen ? 'Cue Out 1-2' : 'Direct Out 1-2';
+                    onSelectOutput?.(channel.id, 'hardware', 'default', defLabel);
+                    setShowOutputMenu(false);
+                  }}
+                  className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left flex items-center justify-between gap-2"
+                >
+                  <span className="truncate">
+                    {isMaster ? 'Default Out 1-2' : isListen ? 'Cue Out 1-2 (Default)' : 'Direct Out 1-2 (Default)'}
+                  </span>
+                  {resolvedOutputType === 'hardware' && resolvedOutputId === 'default' && (
+                    <Check className="w-3 h-3 text-emerald-400 shrink-0" />
+                  )}
+                </button>
+
+                {(asioConfig?.activeOutputChannels ?? []).length > 0 && (
+                  <>
+                    <div className="px-2.5 pt-1.5 pb-0.5 text-[9px] text-slate-400 border-t border-white/10 mt-1">
+                      ASIO Output Channels
+                    </div>
+                    {(asioConfig?.activeOutputChannels ?? []).map((asioOutLabel) => {
+                      const matchedDev = outputDevices.find((d) => d.label === asioOutLabel);
+                      const resolvedDevId = matchedDev?.deviceId ?? asioConfig?.outputDeviceId ?? 'default';
+                      const selected =
+                        resolvedOutputType === 'hardware' && resolvedOutputLabel === asioOutLabel;
+                      return (
+                        <button
+                          key={asioOutLabel}
+                          type="button"
+                          onClick={() => {
+                            onSelectOutput?.(channel.id, 'hardware', resolvedDevId, asioOutLabel);
+                            setShowOutputMenu(false);
+                          }}
+                          className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left flex items-center justify-between gap-2"
+                        >
+                          <span className="truncate">{asioOutLabel}</span>
+                          {selected && <Check className="w-3 h-3 text-emerald-400 shrink-0" />}
+                        </button>
+                      );
+                    })}
+                  </>
+                )}
+
+                {outputDevices.length > 0 && (
+                  <>
+                    <div className="px-2.5 pt-1.5 pb-0.5 text-[9px] text-emerald-300 border-t border-white/10 mt-1">
+                      Detected Hardware Outputs
+                    </div>
+                    {outputDevices.map((dev) => {
+                      const selected =
+                        resolvedOutputType === 'hardware' &&
+                        resolvedOutputId === dev.deviceId &&
+                        resolvedOutputLabel === dev.label;
+                      return (
+                        <button
+                          key={dev.deviceId}
+                          type="button"
+                          onClick={() => {
+                            onSelectOutput?.(channel.id, 'hardware', dev.deviceId, dev.label);
+                            setShowOutputMenu(false);
+                          }}
+                          className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left flex items-center justify-between gap-2"
+                        >
+                          <span className="truncate">{dev.label}</span>
+                          {selected && <Check className="w-3 h-3 text-emerald-400 shrink-0" />}
+                        </button>
+                      );
+                    })}
+                  </>
+                )}
+
+                {onScanOutputDevices && (
+                  <div className="pt-1 mt-1 px-2 border-t border-white/10">
+                    <button
+                      type="button"
+                      disabled={scanningOutputs}
+                      onClick={async () => {
+                        setScanningOutputs(true);
+                        try {
+                          await onScanOutputDevices();
+                        } finally {
+                          setScanningOutputs(false);
+                        }
+                      }}
+                      className="w-full py-1 px-2 rounded bg-[#1d2229] hover:bg-[#3e444c] text-[10px] text-[var(--theme-neon-soft)] text-center transition-colors"
+                    >
+                      {scanningOutputs ? 'Memindai perangkat...' : 'Scan Perangkat Output'}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* Section 4: Pan Slider OR Dual -∞ Readout */}
       {isMaster || isListen ? (
@@ -1442,6 +1829,19 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 <span className="text-slate-500">Empty</span>
               )}
             </button>
+            {channel.inputSource === 'mic' && (
+              <button
+                type="button"
+                title="Mode Mic: L+R (Mono Center) / L (In 1) / R (In 2) / St (Stereo)"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  cycleMicChannelMode();
+                }}
+                className="h-[17px] px-1 rounded-[2px] bg-[#131824] border border-[rgba(var(--theme-neon-rgb),0.45)] text-[8.5px] font-bold text-[var(--theme-neon-soft)] hover:bg-[#1a2234] shrink-0"
+              >
+                {micModeLabel(channel.micChannelMode)}
+              </button>
+            )}
             <button
               type="button"
               title="Load Audio File (.wav/.mp3)"

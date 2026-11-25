@@ -24,11 +24,18 @@ import {
   InputSourceType,
   InsertPlugin,
   MeterReading,
+  MicChannelMode,
+  OutputTargetType,
   SpecialEffectPad,
   ThemePreset,
   ThemePresetId,
   TransportState,
 } from './types/mixer';
+import {
+  inferMicChannelMode,
+  isStereoVirtualInputLabel,
+  matchHardwareDeviceForChannelLabel,
+} from './utils/audioDeviceMatch';
 
 const STORAGE_KEY = 'govimix-session-v12';
 const LEGACY_STORAGE_KEY = 'govimix-session-v11';
@@ -75,23 +82,29 @@ export default function App() {
       tintBg: initTheme.tintBg,
     };
     if (parsed && Array.isArray(parsed.channels) && parsed.channels.length > 0) {
-      return (parsed.channels as ChannelState[]).map((ch) => {
-        // In-memory File AudioBuffers do not persist across browser reloads
-        if (ch.inputSource === 'file') {
-          const fallbackDemo = ch.id === 'ch-2' || ch.id === 'ch-3';
+      let nextIdx = 1;
+      return (parsed.channels as ChannelState[])
+        .filter((ch) => !(ch.id === 'ch-1' && ch.name === 'RECORD'))
+        .map((ch) => {
+          const idx = ch.type === 'audio' || ch.type === 'fx' ? nextIdx++ : ch.index;
+          // In-memory File AudioBuffers do not persist across browser reloads
+          if (ch.inputSource === 'file') {
+            const fallbackDemo = ch.id === 'ch-2' || ch.id === 'ch-3';
+            return {
+              ...ch,
+              index: idx,
+              ...themeColor,
+              inputSource: fallbackDemo ? 'demo' : 'none',
+              inputLabel: fallbackDemo ? `Stem In ${idx}` : 'None',
+              audioFileName: undefined,
+            };
+          }
           return {
             ...ch,
+            index: idx,
             ...themeColor,
-            inputSource: fallbackDemo ? 'demo' : 'none',
-            inputLabel: fallbackDemo ? `Stem In ${ch.index}` : 'None',
-            audioFileName: undefined,
           };
-        }
-        return {
-          ...ch,
-          ...themeColor,
-        };
-      });
+        });
     }
     return INITIAL_CHANNELS.map((ch) => ({ ...ch, ...themeColor }));
   });
@@ -141,6 +154,7 @@ export default function App() {
   const [meters, setMeters] = useState<Record<string, MeterReading>>({});
   const [recordedAudioUrl] = useState<string | null>(null);
   const [inputDevices, setInputDevices] = useState<AudioDeviceInfo[]>([]);
+  const [outputDevices, setOutputDevices] = useState<AudioDeviceInfo[]>([]);
   const [audioNotice, setAudioNotice] = useState<string | null>(null);
   const [cpuMetrics, setCpuMetrics] = useState<CpuMonitorMetrics>({
     cpuPercent: 5,
@@ -159,43 +173,100 @@ export default function App() {
   const lastCpuSampleRef = useRef<number>(0);
 
   useEffect(() => {
-    audioEngine.enumerateHardwareDevices(false).then((list) => {
-      setInputDevices(list.filter((d) => d.kind === 'audioinput'));
-    });
+    const refreshInputs = () => {
+      audioEngine.enumerateHardwareDevices(false).then((list) => {
+        setInputDevices(list.filter((d) => d.kind === 'audioinput'));
+        setOutputDevices(list.filter((d) => d.kind === 'audiooutput'));
+      });
+    };
+    refreshInputs();
 
-    let unlocked = false;
-    const unlockLiveAudio = async () => {
-      if (unlocked) return;
-      unlocked = true;
-      try {
-        await audioEngine.ensureContext(asioConfigRef.current.sampleRate);
-        audioEngine.rebuildGraph(channelsRef.current);
-        for (const ch of channelsRef.current) {
-          if (ch.type === 'audio' && ch.inputSource === 'mic' && ch.monitor && !audioEngine.hasActiveLiveStream(ch.id)) {
-            await audioEngine.enableLiveMicInput(
-              ch.id,
-              ch.inputDeviceId ?? asioConfigRef.current.inputDeviceId,
-              true
-            );
-          }
-        }
-      } catch {
-        // Browser may require explicit interaction before resuming AudioContext
-        unlocked = false;
+    const handleDeviceChange = () => {
+      refreshInputs();
+      if (audioEngine.isInitialized()) {
+        const cfg = asioConfigRef.current;
+        const outputActive =
+          cfg.activeDeviceName !== 'No Audio Device' &&
+          (cfg.activeOutputChannels === undefined || cfg.activeOutputChannels.length > 0);
+        audioEngine.setMasterOutputEnabled(outputActive);
+        void audioEngine.setOutputDevice(cfg.outputDeviceId);
       }
     };
 
-    // Attempt immediate initialization (works immediately in Electron .exe)
-    unlockLiveAudio();
+    const md = navigator.mediaDevices;
+    if (md?.addEventListener) {
+      md.addEventListener('devicechange', handleDeviceChange);
+    }
+
+    let unlocked = false;
+    let gestureUnlockInFlight = false;
+    const unlockLiveAudio = async (fromGesture: boolean) => {
+      if (unlocked) return;
+      if (fromGesture && gestureUnlockInFlight) return;
+      if (fromGesture) gestureUnlockInFlight = true;
+      try {
+        const cfg = asioConfigRef.current;
+        const outputActive =
+          cfg.activeDeviceName !== 'No Audio Device' &&
+          (cfg.activeOutputChannels === undefined || cfg.activeOutputChannels.length > 0);
+        audioEngine.setMasterOutputEnabled(outputActive);
+        const ctx = await audioEngine.ensureContext(cfg.sampleRate, cfg.bufferSize);
+        if (fromGesture) {
+          await audioEngine.resumeIfNeeded(true);
+        }
+        audioEngine.rebuildGraph(channelsRef.current);
+        await audioEngine.setOutputDevice(cfg.outputDeviceId);
+
+        if (ctx.state !== 'running') {
+          return;
+        }
+
+        unlocked = true;
+        window.removeEventListener('pointerdown', onFirstGesture);
+        window.removeEventListener('keydown', onFirstGesture);
+
+        const inputsAllowed =
+          cfg.activeDeviceName !== 'No Audio Device' &&
+          (cfg.activeInputChannels === undefined || cfg.activeInputChannels.length > 0);
+
+        if (inputsAllowed) {
+          let enabledAnyMic = false;
+          for (const ch of channelsRef.current) {
+            if (ch.type === 'audio' && ch.inputSource === 'mic' && ch.monitor && !audioEngine.hasActiveLiveStream(ch.id)) {
+              const ok = await audioEngine.enableLiveMicInput(
+                ch.id,
+                ch.inputDeviceId ?? cfg.inputDeviceId,
+                true
+              );
+              if (ok) enabledAnyMic = true;
+            }
+          }
+          if (enabledAnyMic) {
+            refreshInputs();
+          }
+        }
+      } catch {
+        unlocked = false;
+      } finally {
+        if (fromGesture) gestureUnlockInFlight = false;
+      }
+    };
 
     const onFirstGesture = () => {
-      unlockLiveAudio();
+      void unlockLiveAudio(true);
     };
+
+    // Attempt immediate initialization (succeeds immediately in Electron .exe; waits for gesture in browsers)
+    void unlockLiveAudio(false);
+
     window.addEventListener('pointerdown', onFirstGesture, { passive: true });
     window.addEventListener('keydown', onFirstGesture, { passive: true });
     return () => {
       window.removeEventListener('pointerdown', onFirstGesture);
       window.removeEventListener('keydown', onFirstGesture);
+      if (md?.removeEventListener) {
+        md.removeEventListener('devicechange', handleDeviceChange);
+      }
     };
   }, []);
 
@@ -290,19 +361,50 @@ export default function App() {
     }, 5000);
   };
 
+  const ensureOutputReady = async () => {
+    const cfg = asioConfigRef.current;
+    const outputActive =
+      cfg.activeDeviceName !== 'No Audio Device' &&
+      (cfg.activeOutputChannels === undefined || cfg.activeOutputChannels.length > 0);
+    audioEngine.setMasterOutputEnabled(outputActive);
+    await audioEngine.ensureContext(cfg.sampleRate, cfg.bufferSize);
+    await audioEngine.resumeIfNeeded(true);
+    audioEngine.rebuildGraph(channelsRef.current);
+    await audioEngine.setOutputDevice(cfg.outputDeviceId);
+    if (!outputActive) {
+      showTemporaryNotice('Output audio sedang mati. Buka ASIO lalu centang minimal satu Active output channel.');
+    }
+    return cfg;
+  };
+
   const handleToggleMic = async (channelId: string) => {
     const target = channelsRef.current.find((c) => c.id === channelId);
     if (!target) return;
     const nextMonitor = !target.monitor;
-    await audioEngine.ensureContext(asioConfigRef.current.sampleRate);
-    audioEngine.rebuildGraph(channelsRef.current);
+    const cfg = await ensureOutputReady();
 
     if (target.inputSource === 'mic') {
-      await audioEngine.enableLiveMicInput(
+      if (
+        nextMonitor &&
+        (cfg.activeDeviceName === 'No Audio Device' ||
+          (cfg.activeInputChannels !== undefined && cfg.activeInputChannels.length === 0))
+      ) {
+        showTemporaryNotice('Input mikrofon mati di ASIO Settings. Centang minimal satu Active input channel.');
+        return;
+      }
+      const ok = await audioEngine.enableLiveMicInput(
         channelId,
-        target.inputDeviceId ?? asioConfigRef.current.inputDeviceId,
+        target.inputDeviceId ?? cfg.inputDeviceId,
         nextMonitor
       );
+      if (nextMonitor && !ok) {
+        showTemporaryNotice('Gagal membuka mikrofon. Pastikan izin mikrofon browser diizinkan.');
+        return;
+      }
+      if (nextMonitor) {
+        const devs = await audioEngine.enumerateHardwareDevices(false);
+        setInputDevices(devs.filter((d) => d.kind === 'audioinput'));
+      }
     } else if (target.inputSource === 'app') {
       if (nextMonitor) {
         if (!audioEngine.hasActiveLiveStream(channelId)) {
@@ -310,7 +412,10 @@ export default function App() {
             updateChannel(channelId, (c) => ({ ...c, monitor: false }));
           });
           if (!ok) {
-            showTemporaryNotice('Centang "Share audio" / "Share system audio" agar audio aplikasi langsung masuk.');
+            showTemporaryNotice(
+              audioEngine.getLastAppCaptureError() ??
+                'Centang "Share audio" / "Share system audio" agar audio aplikasi langsung masuk.'
+            );
             return;
           }
         }
@@ -319,18 +424,33 @@ export default function App() {
       }
     } else if (target.inputSource === 'file') {
       if (nextMonitor) {
-        await audioEngine.playFileForChannel(channelId, asioConfigRef.current.sampleRate, true);
+        await audioEngine.playFileForChannel(channelId, cfg.sampleRate, true);
       } else {
         audioEngine.stopFileForChannel(channelId);
       }
     } else if (target.inputSource === 'demo') {
-      if (nextMonitor) {
+      if (!transportRef.current.isPlaying) {
+        const nextChannels = channelsRef.current.map((c) =>
+          c.id === channelId ? { ...c, monitor: true, mute: false } : c
+        );
+        channelsRef.current = nextChannels;
+        setChannels(nextChannels);
         const nextT = { ...transportRef.current, isPlaying: true };
         setTransport(nextT);
-        await audioEngine.startPlayback(nextT, channelsRef.current, asioConfigRef.current);
+        await audioEngine.startPlayback(nextT, nextChannels, cfg);
+        return;
       } else {
-        audioEngine.stopPlayback();
-        setTransport((t) => ({ ...t, isPlaying: false }));
+        const nextChannels = channelsRef.current.map((c) =>
+          c.id === channelId ? { ...c, monitor: nextMonitor } : c
+        );
+        channelsRef.current = nextChannels;
+        setChannels(nextChannels);
+        const anyDemoMonitored = nextChannels.some((c) => c.inputSource === 'demo' && c.monitor);
+        if (!anyDemoMonitored) {
+          audioEngine.stopPlayback();
+          setTransport((t) => ({ ...t, isPlaying: false }));
+        }
+        return;
       }
     }
 
@@ -342,15 +462,36 @@ export default function App() {
     source: InputSourceType,
     channelIndex: number,
     label: string,
-    deviceId?: string
+    deviceId?: string,
+    micMode?: MicChannelMode
   ) => {
-    await audioEngine.ensureContext(asioConfigRef.current.sampleRate);
-    audioEngine.rebuildGraph(channelsRef.current);
+    const cfg = await ensureOutputReady();
     audioEngine.stopFileForChannel(channelId);
 
+    let resolvedDeviceId = deviceId;
+    const isVirtualStereoChannel = source === 'mic' && isStereoVirtualInputLabel(label);
+
     if (source === 'mic') {
-      const targetDev = deviceId ?? asioConfigRef.current.inputDeviceId;
-      await audioEngine.enableLiveMicInput(channelId, targetDev, true);
+      if (!resolvedDeviceId && isVirtualStereoChannel) {
+        const scanned = await audioEngine.enumerateHardwareDevices(true);
+        setInputDevices(scanned.filter((d) => d.kind === 'audioinput'));
+        setOutputDevices(scanned.filter((d) => d.kind === 'audiooutput'));
+        const matched = matchHardwareDeviceForChannelLabel(label, scanned, 'audioinput');
+        resolvedDeviceId = matched?.deviceId;
+        if (!resolvedDeviceId) {
+          showTemporaryNotice(
+            `Endpoint virtual "${label}" belum terdeteksi browser. Aktifkan driver virtual (Maono VC / VB-Cable / Stereo Mix) di Windows Sound Input lalu klik Scan Perangkat Input.`
+          );
+          return;
+        }
+      }
+
+      const targetDev = resolvedDeviceId ?? cfg.inputDeviceId;
+      const ok = await audioEngine.enableLiveMicInput(channelId, targetDev, true);
+      if (!ok) {
+        showTemporaryNotice('Input audio tidak dapat diakses. Periksa izin mikrofon browser atau ASIO Settings.');
+        return;
+      }
       const devs = await audioEngine.enumerateHardwareDevices(false);
       setInputDevices(devs.filter((d) => d.kind === 'audioinput'));
     } else if (source === 'app') {
@@ -358,13 +499,17 @@ export default function App() {
         updateChannel(channelId, (c) => ({ ...c, monitor: false }));
       });
       if (!ok) {
-        showTemporaryNotice('Audio aplikasi belum terpilih. Centang "Share audio" / "Share system audio" di popup.');
+        showTemporaryNotice(
+          audioEngine.getLastAppCaptureError() ??
+            'Audio aplikasi belum terpilih. Centang "Share audio" / "Share system audio" di popup.'
+        );
         return;
       }
     } else {
       await audioEngine.enableLiveMicInput(channelId, undefined, false);
     }
 
+    const nextMicMode = source === 'mic' ? micMode ?? inferMicChannelMode(label) : undefined;
     const nextChannels = channelsRef.current.map((c) =>
       c.id === channelId
         ? {
@@ -372,7 +517,8 @@ export default function App() {
             inputSource: source,
             inputChannelIndex: channelIndex,
             inputLabel: label,
-            inputDeviceId: deviceId,
+            inputDeviceId: resolvedDeviceId ?? deviceId,
+            ...(nextMicMode ? { micChannelMode: nextMicMode } : {}),
             monitor: source === 'mic' || source === 'app' || source === 'demo' ? true : false,
             mute: source === 'none' ? c.mute : false,
           }
@@ -380,20 +526,87 @@ export default function App() {
     );
     channelsRef.current = nextChannels;
     setChannels(nextChannels);
+    audioEngine.syncParameters(nextChannels);
 
     if (source === 'demo') {
       const nextT = { ...transportRef.current, isPlaying: true };
       setTransport(nextT);
-      await audioEngine.startPlayback(nextT, nextChannels, asioConfigRef.current);
+      await audioEngine.startPlayback(nextT, nextChannels, cfg);
     } else if (!nextChannels.some((c) => c.inputSource === 'demo' && c.monitor)) {
       audioEngine.stopPlayback();
       setTransport((t) => ({ ...t, isPlaying: false }));
     }
   };
 
+  const handleSelectOutput = async (
+    channelId: string,
+    targetType: OutputTargetType,
+    targetId: string,
+    label: string
+  ) => {
+    const cfg = await ensureOutputReady();
+    const targetChannel = channelsRef.current.find((c) => c.id === channelId);
+    const normalizedHwId =
+      !targetId || targetId === 'default' || targetId.startsWith('default-')
+        ? 'default'
+        : targetId;
+
+    const nextChannels = channelsRef.current.map((c) =>
+      c.id === channelId
+        ? {
+            ...c,
+            outputTargetType: targetType,
+            outputTargetId: targetType === 'hardware' ? normalizedHwId : targetId,
+            outputLabel: label,
+          }
+        : c
+    );
+    channelsRef.current = nextChannels;
+    setChannels(nextChannels);
+    audioEngine.rebuildGraph(nextChannels);
+
+    if (targetChannel?.type === 'master') {
+      if (targetType === 'none') {
+        audioEngine.setMasterOutputEnabled(false);
+        showTemporaryNotice('Output Main dimatikan (None).');
+        return;
+      }
+      const asioOutputEnabled =
+        cfg.activeDeviceName !== 'No Audio Device' &&
+        (cfg.activeOutputChannels === undefined || cfg.activeOutputChannels.length > 0);
+      audioEngine.setMasterOutputEnabled(asioOutputEnabled);
+      if (targetType === 'hardware') {
+        setAsioConfig((prev) => ({
+          ...prev,
+          outputDeviceId: normalizedHwId,
+        }));
+        const ok = await audioEngine.setOutputDevice(normalizedHwId);
+        const outErr = audioEngine.getLastOutputError();
+        if (!ok && outErr) {
+          showTemporaryNotice(outErr);
+        }
+      }
+    } else if (targetType === 'hardware' && normalizedHwId !== 'default') {
+      window.setTimeout(() => {
+        const outErr = audioEngine.getLastOutputError();
+        if (outErr) showTemporaryNotice(outErr);
+      }, 250);
+    }
+  };
+
+  const handleScanOutputDevices = async () => {
+    const list = await audioEngine.enumerateHardwareDevices(true);
+    setInputDevices(list.filter((d) => d.kind === 'audioinput'));
+    setOutputDevices(list.filter((d) => d.kind === 'audiooutput'));
+  };
+
   const handleLoadFile = async (channelId: string, file: File) => {
+    const cfg = await ensureOutputReady();
     const res = await audioEngine.loadAudioFileForChannel(channelId, file);
-    if (!res) return;
+    if (!res) {
+      showTemporaryNotice('File audio gagal didekode. Pastikan format WAV/MP3/OGG valid.');
+      return;
+    }
     const nextChannels = channelsRef.current.map((c) =>
       c.id === channelId
         ? {
@@ -408,7 +621,9 @@ export default function App() {
     );
     channelsRef.current = nextChannels;
     setChannels(nextChannels);
-    await audioEngine.playFileForChannel(channelId, asioConfigRef.current.sampleRate, true);
+    audioEngine.rebuildGraph(nextChannels);
+    await audioEngine.playFileForChannel(channelId, cfg.sampleRate, true);
+    setTransport((t) => ({ ...t, isPlaying: true }));
   };
 
   const applyThemeToChannels = (nextTheme: ThemePreset) => {
@@ -461,6 +676,9 @@ export default function App() {
       sends: [],
       inputSource: 'none',
       inputChannelIndex: nextIdx,
+      outputTargetType: 'master',
+      outputTargetId: 'main-bus',
+      outputLabel: 'Main',
     };
     const firstMasterIdx = channels.findIndex((c) => c.type === 'master' || c.type === 'listen');
     const updated = [...channels];
@@ -506,6 +724,9 @@ export default function App() {
       sends: [],
       inputSource: 'none',
       inputChannelIndex: 0,
+      outputTargetType: 'master',
+      outputTargetId: 'main-bus',
+      outputLabel: 'Main',
     };
     const firstMasterIdx = channels.findIndex((c) => c.type === 'master' || c.type === 'listen');
     const updated = [...channels];
@@ -526,33 +747,93 @@ export default function App() {
 
   const handleApplyAudioSettings = async (
     sampleRate: 44100 | 48000 | 88200 | 96000,
-    outputDeviceId: string
+    outputDeviceId: string,
+    bufferSize?: 32 | 64 | 128 | 256 | 512 | 1024
   ) => {
     const wasPlaying = transport.isPlaying;
     if (wasPlaying) audioEngine.stopPlayback();
-    const { baseLatencyMs, outputLatencyMs } = await audioEngine.rebuildSampleRate(sampleRate, channels);
+    const cfg = asioConfigRef.current;
+    const effectiveBuf = bufferSize ?? cfg.bufferSize;
+    const outputActive =
+      cfg.activeDeviceName !== 'No Audio Device' &&
+      (cfg.activeOutputChannels === undefined || cfg.activeOutputChannels.length > 0);
+    audioEngine.setMasterOutputEnabled(outputActive);
+
+    const { baseLatencyMs, outputLatencyMs } = await audioEngine.rebuildSampleRate(
+      sampleRate,
+      channels,
+      effectiveBuf
+    );
     await audioEngine.setOutputDevice(outputDeviceId);
     setAsioConfig((prev) => ({
       ...prev,
       baseLatencyMs,
       outputLatencyMs,
     }));
+
+    const inputsAllowed =
+      cfg.activeDeviceName !== 'No Audio Device' &&
+      (cfg.activeInputChannels === undefined || cfg.activeInputChannels.length > 0);
+
     for (const ch of channelsRef.current) {
       if (ch.type === 'audio' && ch.monitor) {
         if (ch.inputSource === 'mic') {
-          await audioEngine.enableLiveMicInput(ch.id, ch.inputDeviceId ?? asioConfig.inputDeviceId, true);
+          if (inputsAllowed) {
+            await audioEngine.enableLiveMicInput(ch.id, ch.inputDeviceId ?? cfg.inputDeviceId, true);
+          } else {
+            await audioEngine.enableLiveMicInput(ch.id, undefined, false);
+          }
         } else if (ch.inputSource === 'file') {
           await audioEngine.playFileForChannel(ch.id, sampleRate, true);
         }
       }
     }
     if (wasPlaying) {
-      await audioEngine.startPlayback(transport, channels, { ...asioConfig, sampleRate });
+      await audioEngine.startPlayback(transport, channels, { ...cfg, sampleRate });
+    }
+  };
+
+  const handleApplyInputDevice = async (inputDeviceId: string, activeInputLabels: string[]) => {
+    const hasActiveInputs = activeInputLabels.length > 0;
+    const primaryLabel = activeInputLabels[0];
+
+    setChannels((prev) =>
+      prev.map((ch) => {
+        if (ch.type !== 'audio' || ch.inputSource !== 'mic') return ch;
+        const followsPrimary =
+          !ch.inputDeviceId ||
+          ch.inputDeviceId === 'default' ||
+          ch.inputDeviceId.startsWith('default-') ||
+          ch.inputLabel?.startsWith('ASIO In ');
+        if (!followsPrimary && hasActiveInputs) return ch;
+        return {
+          ...ch,
+          inputDeviceId,
+          inputLabel: primaryLabel ?? ch.inputLabel,
+        };
+      })
+    );
+
+    if (!audioEngine.isInitialized()) return;
+
+    for (const ch of channelsRef.current) {
+      if (ch.type !== 'audio' || ch.inputSource !== 'mic') continue;
+      if (!hasActiveInputs) {
+        await audioEngine.enableLiveMicInput(ch.id, undefined, false);
+      } else if (ch.monitor) {
+        const followsPrimary =
+          !ch.inputDeviceId ||
+          ch.inputDeviceId === 'default' ||
+          ch.inputDeviceId.startsWith('default-') ||
+          ch.inputLabel?.startsWith('ASIO In ');
+        const targetId = followsPrimary ? inputDeviceId : ch.inputDeviceId;
+        await audioEngine.enableLiveMicInput(ch.id, targetId, true);
+      }
     }
   };
 
   const handleTriggerSfxPad = async (pad: SpecialEffectPad) => {
-    await audioEngine.ensureContext(asioConfig.sampleRate);
+    await audioEngine.ensureContext(asioConfig.sampleRate, asioConfig.bufferSize);
     audioEngine.rebuildGraph(channelsRef.current);
     await audioEngine.triggerSpecialEffectPad(pad, 'ch-7', channelsRef.current);
   };
@@ -661,9 +942,10 @@ export default function App() {
               allChannels={channels}
               asioConfig={asioConfig}
               inputDevices={inputDevices}
+              outputDevices={outputDevices}
               isSelected={selectedChannelId === ch.id}
               meter={meters[ch.id] ?? { left: 0, right: 0, peakDb: -60, clipped: false }}
-              canDelete={ch.index > 8}
+              canDelete={ch.id.startsWith('ch-custom-') || ch.id.startsWith('fx-custom-')}
               onSelect={() => setSelectedChannelId(ch.id)}
               onUpdate={(updater) => updateChannel(ch.id, updater)}
               onDeleteChannel={() => handleDeleteChannel(ch.id)}
@@ -674,6 +956,8 @@ export default function App() {
               onLoadFile={handleLoadFile}
               onToggleMic={handleToggleMic}
               onSelectInput={handleSelectInput}
+              onSelectOutput={handleSelectOutput}
+              onScanOutputDevices={handleScanOutputDevices}
             />
           ))}
 
@@ -717,6 +1001,7 @@ export default function App() {
               fxBuses={fxBuses}
               allChannels={channels}
               asioConfig={asioConfig}
+              outputDevices={outputDevices}
               isSelected={selectedChannelId === ch.id}
               meter={meters[ch.id] ?? { left: 0, right: 0, peakDb: -60, clipped: false }}
               onSelect={() => setSelectedChannelId(ch.id)}
@@ -727,6 +1012,8 @@ export default function App() {
               onResetClip={() => audioEngine.clearClip(ch.id)}
               onLoadFile={handleLoadFile}
               onToggleMic={handleToggleMic}
+              onSelectOutput={handleSelectOutput}
+              onScanOutputDevices={handleScanOutputDevices}
             />
           ))}
         </div>
@@ -766,6 +1053,11 @@ export default function App() {
           onClose={() => setShowAsioModal(false)}
           onUpdateConfig={(next) => setAsioConfig((prev) => ({ ...prev, ...next }))}
           onApplyAudioSettings={handleApplyAudioSettings}
+          onApplyInputDevice={handleApplyInputDevice}
+          onDevicesScanned={(devs) => {
+            setInputDevices(devs.filter((d) => d.kind === 'audioinput'));
+            setOutputDevices(devs.filter((d) => d.kind === 'audiooutput'));
+          }}
         />
       )}
 

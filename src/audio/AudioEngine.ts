@@ -15,24 +15,40 @@ interface ChannelNodes {
   highFilter: BiquadFilterNode;
   megaphoneFilter: BiquadFilterNode;
   compressor: DynamicsCompressorNode;
-  revPreDelay: DelayNode;
+  revPreDelay?: DelayNode;
   revDryGain: GainNode;
-  revWetGain: GainNode;
-  delayWetGain: GainNode;
-  harmonyWetGain: GainNode;
+  revWetGain?: GainNode;
+  delayWetGain?: GainNode;
+  harmonyWetGain?: GainNode;
   harmonyVoiceGains: GainNode[];
+  harmonyLfoOscs: OscillatorNode[];
   panner: StereoPannerNode;
   faderGain: GainNode;
   fxConvolver?: ConvolverNode;
   fxDelay?: DelayNode;
   fxFeedback?: GainNode;
   fxTone?: BiquadFilterNode;
+  reverbBranchWired?: boolean;
+  delayBranchWired?: boolean;
+  harmonyBranchWired?: boolean;
   splitter: ChannelSplitterNode;
   analyserL: AnalyserNode;
   analyserR: AnalyserNode;
+  outputRouterGain: GainNode;
+  outRouteKey?: string;
+  directSinkDest?: MediaStreamAudioDestinationNode;
+  directSinkAudio?: HTMLAudioElement;
+  directSinkDeviceId?: string;
   sendGains: Map<string, GainNode>;
   micSource?: MediaStreamAudioSourceNode;
   micStream?: MediaStream;
+  micDeviceId?: string;
+  micSplitter?: ChannelSplitterNode;
+  micMerger?: ChannelMergerNode;
+  micGainLL?: GainNode;
+  micGainLR?: GainNode;
+  micGainRL?: GainNode;
+  micGainRR?: GainNode;
 }
 
 export function dbToLinear(db: number): number {
@@ -90,8 +106,23 @@ export class StudioAudioEngine {
   private recordedChunks: Blob[] = [];
   private recordDest: MediaStreamAudioDestinationNode | null = null;
 
+  // Hardware output routing state
+  private currentOutputDeviceId = 'default';
+  private appliedSinkId = '';
+  private currentBufferSize = 256;
+  private masterOutputEnabled = true;
+  private masterOutputGain: GainNode | null = null;
+  private lastOutputError: string | null = null;
+  private lastAppCaptureError: string | null = null;
+
   // ASIO Bridge WebSocket
   private asioSocket: WebSocket | null = null;
+
+  private getLatencyHintForBuffer(bufferSize: number): AudioContextLatencyCategory {
+    if (bufferSize <= 64) return 'interactive';
+    if (bufferSize <= 256) return 'balanced';
+    return 'playback';
+  }
 
   public isInitialized(): boolean {
     return this.ctx !== null;
@@ -101,61 +132,298 @@ export class StudioAudioEngine {
     return this.ctx;
   }
 
-  public async ensureContext(sampleRate: number = 48000): Promise<AudioContext> {
+  public getContextState(): AudioContextState | 'uninitialized' {
+    return this.ctx ? this.ctx.state : 'uninitialized';
+  }
+
+  public async ensureContext(sampleRate: number = 48000, bufferSize?: number): Promise<AudioContext> {
+    if (bufferSize !== undefined) {
+      this.currentBufferSize = bufferSize;
+    }
     if (!this.ctx) {
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const latencyHint = this.getLatencyHintForBuffer(this.currentBufferSize);
       try {
-        // Prioritize ultra-low latency hardware callback (~2ms target)
         this.ctx = new AudioCtx({
-          latencyHint: 0.002,
+          latencyHint,
           sampleRate,
         });
       } catch {
-        try {
-          this.ctx = new AudioCtx({
-            latencyHint: 'interactive',
-            sampleRate,
-          });
-        } catch {
-          this.ctx = new AudioCtx({
-            latencyHint: 'interactive',
-          });
-        }
+        this.ctx = new AudioCtx({
+          latencyHint,
+        });
       }
+      this.appliedSinkId = '';
       if (this.channelsSnapshot.length > 0) {
         this.rebuildGraph(this.channelsSnapshot);
       }
+      if (this.currentOutputDeviceId && this.currentOutputDeviceId !== 'default') {
+        void this.setOutputDevice(this.currentOutputDeviceId);
+      }
     }
     if (this.ctx.state === 'suspended') {
-      await this.ctx.resume();
+      await this.resumeIfNeeded(false);
     }
     return this.ctx;
   }
 
-  public async rebuildSampleRate(sampleRate: 44100 | 48000 | 88200 | 96000, channels: ChannelState[]): Promise<{ baseLatencyMs: number; outputLatencyMs: number }> {
+  public async resumeIfNeeded(fromGesture = false): Promise<boolean> {
+    if (!this.ctx) return false;
+    if (this.ctx.state === 'running') return true;
+    try {
+      // Avoid hanging indefinitely when called outside a user gesture in Chrome,
+      // but allow real user gestures ample time to wake hardware drivers.
+      const timeoutMs = fromGesture ? 1500 : 200;
+      await Promise.race([
+        this.ctx.resume(),
+        new Promise<void>((resolve) => window.setTimeout(resolve, timeoutMs)),
+      ]);
+    } catch {
+      // ignore if blocked prior to user gesture
+    }
+    return this.getContextState() === 'running';
+  }
+
+  public async rebuildSampleRate(
+    sampleRate: 44100 | 48000 | 88200 | 96000,
+    channels: ChannelState[],
+    bufferSize?: number
+  ): Promise<{ baseLatencyMs: number; outputLatencyMs: number }> {
+    if (bufferSize !== undefined) {
+      this.currentBufferSize = bufferSize;
+    }
     this.stopScheduler();
+    for (const chId of Array.from(this.channelFileSources.keys())) {
+      this.stopFileForChannel(chId);
+    }
+    for (const nodes of this.channelNodes.values()) {
+      this.cleanupDirectSink(nodes);
+      for (const osc of nodes.harmonyLfoOscs) {
+        try {
+          osc.stop();
+          osc.disconnect();
+        } catch {
+          // ignore
+        }
+      }
+      nodes.harmonyLfoOscs = [];
+      if (nodes.micSource) {
+        try {
+          nodes.micSource.disconnect();
+        } catch {
+          // ignore
+        }
+        nodes.micSource = undefined;
+      }
+      if (nodes.micStream) {
+        nodes.micStream.getTracks().forEach((t) => t.stop());
+        nodes.micStream = undefined;
+      }
+      nodes.micDeviceId = undefined;
+    }
     if (this.ctx) {
       await this.ctx.close();
       this.ctx = null;
       this.channelNodes.clear();
+      this.masterOutputGain = null;
+      this.appliedSinkId = '';
     }
-    const ctx = await this.ensureContext(sampleRate);
+    const ctx = await this.ensureContext(sampleRate, this.currentBufferSize);
+    await this.resumeIfNeeded(true);
     this.rebuildGraph(channels);
+    await this.setOutputDevice(this.currentOutputDeviceId);
     const baseMs = Number(((ctx.baseLatency ?? 0.005) * 1000).toFixed(2));
     const outMs = Number((((ctx as AudioContext & { outputLatency?: number }).outputLatency ?? 0.008) * 1000).toFixed(2));
     return { baseLatencyMs: baseMs, outputLatencyMs: outMs };
   }
 
+  public isSinkIdSupported(): boolean {
+    if (typeof window === 'undefined') return false;
+    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return false;
+    return typeof (AudioCtx.prototype as AudioContext & { setSinkId?: unknown }).setSinkId === 'function';
+  }
+
+  public isMasterOutputEnabled(): boolean {
+    return this.masterOutputEnabled;
+  }
+
+  public getLastOutputError(): string | null {
+    return this.lastOutputError;
+  }
+
+  public getLastAppCaptureError(): string | null {
+    return this.lastAppCaptureError;
+  }
+
+  public setMasterOutputEnabled(enabled: boolean): void {
+    this.masterOutputEnabled = enabled;
+    if (this.ctx && this.masterOutputGain) {
+      const mainBus = this.channelsSnapshot.find((c) => c.id === 'main-bus');
+      const mainMutedByOut = mainBus?.outputTargetType === 'none';
+      this.masterOutputGain.gain.setTargetAtTime(enabled && !mainMutedByOut ? 1 : 0, this.ctx.currentTime, 0.008);
+    }
+  }
+
+  private cleanupDirectSink(nodes: ChannelNodes): void {
+    if (nodes.directSinkAudio) {
+      try {
+        nodes.directSinkAudio.pause();
+        nodes.directSinkAudio.srcObject = null;
+      } catch {
+        // ignore
+      }
+      nodes.directSinkAudio = undefined;
+    }
+    if (nodes.directSinkDest) {
+      try {
+        nodes.directSinkDest.disconnect();
+      } catch {
+        // ignore
+      }
+      nodes.directSinkDest = undefined;
+    }
+    nodes.directSinkDeviceId = undefined;
+  }
+
+  private wouldCreateOutputCycle(sourceId: string, targetBusId: string, channels: ChannelState[]): boolean {
+    const visited = new Set<string>([sourceId]);
+    let cursor: string | undefined = targetBusId;
+    while (cursor) {
+      if (visited.has(cursor)) return true;
+      visited.add(cursor);
+      const ch = channels.find((c) => c.id === cursor);
+      if (!ch) break;
+      const outType = ch.outputTargetType ?? (ch.type === 'listen' ? 'hardware' : ch.type === 'master' ? 'hardware' : 'master');
+      if (outType !== 'bus') break;
+      cursor = ch.outputTargetId;
+    }
+    return false;
+  }
+
+  private routeChannelToHardwareSink(nodes: ChannelNodes, rawDeviceId?: string): void {
+    if (!this.ctx) return;
+    const ctx = this.ctx;
+    const normalized =
+      !rawDeviceId || rawDeviceId === 'default' || rawDeviceId.startsWith('default-')
+        ? 'default'
+        : rawDeviceId;
+
+    const fallbackDest: AudioNode = this.masterOutputGain ?? ctx.destination;
+    if (normalized === 'default' || normalized === this.currentOutputDeviceId) {
+      this.cleanupDirectSink(nodes);
+      nodes.outputRouterGain.connect(fallbackDest);
+      return;
+    }
+
+    if (nodes.directSinkDest && nodes.directSinkAudio && nodes.directSinkDeviceId === normalized) {
+      nodes.outputRouterGain.connect(nodes.directSinkDest);
+      return;
+    }
+
+    this.cleanupDirectSink(nodes);
+    try {
+      const streamDest = ctx.createMediaStreamDestination();
+      const audioEl = new Audio();
+      audioEl.autoplay = true;
+      audioEl.srcObject = streamDest.stream;
+      const elWithSink = audioEl as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> };
+      if (typeof elWithSink.setSinkId === 'function') {
+        void elWithSink
+          .setSinkId(normalized)
+          .then(() => audioEl.play().catch(() => {}))
+          .catch(() => {
+            this.lastOutputError =
+              'Browser memblokir perpindahan output non-default di tab/iframe ini. Output memakai default sistem.';
+            this.cleanupDirectSink(nodes);
+            try {
+              nodes.outputRouterGain.disconnect();
+              nodes.outputRouterGain.connect(fallbackDest);
+            } catch {
+              // ignore
+            }
+          });
+      } else {
+        this.cleanupDirectSink(nodes);
+        nodes.outputRouterGain.connect(fallbackDest);
+        return;
+      }
+      nodes.directSinkDest = streamDest;
+      nodes.directSinkAudio = audioEl;
+      nodes.directSinkDeviceId = normalized;
+      nodes.outputRouterGain.connect(streamDest);
+    } catch {
+      this.cleanupDirectSink(nodes);
+      nodes.outputRouterGain.connect(fallbackDest);
+    }
+  }
+
+  public async selectAudioOutputDevice(): Promise<AudioDeviceInfo | null> {
+    const md = navigator.mediaDevices as MediaDevices & {
+      selectAudioOutput?: (options?: { deviceId?: string }) => Promise<MediaDeviceInfo>;
+    };
+    if (!md?.selectAudioOutput) return null;
+    try {
+      const picked = await md.selectAudioOutput();
+      return {
+        deviceId: picked.deviceId,
+        label: picked.label || 'Selected Audio Output',
+        kind: 'audiooutput',
+        groupId: picked.groupId,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   public async setOutputDevice(deviceId: string): Promise<boolean> {
-    if (!this.ctx) return false;
+    const normalized =
+      !deviceId || deviceId === 'default' || deviceId.startsWith('default-')
+        ? 'default'
+        : deviceId;
+    this.currentOutputDeviceId = normalized;
+    this.lastOutputError = null;
+    if (!this.ctx) return true;
+
+    const sinkId = normalized === 'default' ? '' : normalized;
+    if (sinkId === this.appliedSinkId) {
+      return true;
+    }
+
     const ctxWithSink = this.ctx as AudioContext & { setSinkId?: (id: string) => Promise<void> };
     if (typeof ctxWithSink.setSinkId === 'function') {
       try {
-        await ctxWithSink.setSinkId(deviceId === 'default' ? '' : deviceId);
+        await ctxWithSink.setSinkId(sinkId);
+        this.appliedSinkId = sinkId;
         return true;
-      } catch {
+      } catch (err) {
+        const errName = err instanceof Error ? err.name : '';
+        if (errName === 'NotAllowedError') {
+          this.lastOutputError =
+            'Browser memblokir perpindahan output non-default di tab/iframe ini. Atur Earphone sebagai output default Windows/HP atau buka di tab penuh.';
+        } else if (errName === 'NotFoundError') {
+          this.lastOutputError =
+            'Perangkat output yang dipilih tidak ditemukan. Klik Reset Device / Scan Hardware I/O.';
+        } else {
+          this.lastOutputError =
+            'Gagal memindahkan output ke perangkat terpilih; memakai output default sistem.';
+        }
+        // Fallback to system default if previously saved hardware device was unplugged or blocked
+        if (sinkId !== '') {
+          try {
+            await ctxWithSink.setSinkId('');
+            this.currentOutputDeviceId = 'default';
+            this.appliedSinkId = '';
+          } catch {
+            // ignore
+          }
+        }
         return false;
       }
+    }
+    if (sinkId !== '') {
+      this.lastOutputError =
+        'Browser ini tidak mendukung pemilihan output terpisah (setSinkId); memakai output default OS.';
     }
     return false;
   }
@@ -177,14 +445,28 @@ export class StudioAudioEngine {
       }
     }
     const devices = await navigator.mediaDevices.enumerateDevices();
-    return devices
-      .filter((d) => d.kind === 'audioinput' || d.kind === 'audiooutput')
-      .map((d, idx) => ({
+    let inIdx = 1;
+    let outIdx = 1;
+    const result: AudioDeviceInfo[] = [];
+    for (const d of devices) {
+      if (d.kind !== 'audioinput' && d.kind !== 'audiooutput') continue;
+      if (d.deviceId === 'communications') continue;
+      let label = d.label?.trim();
+      if (!label) {
+        if (d.deviceId === 'default') {
+          label = d.kind === 'audioinput' ? 'Default Audio Input' : 'Default Audio Output';
+        } else {
+          label = d.kind === 'audioinput' ? `Audio Input ${inIdx++}` : `Audio Output ${outIdx++}`;
+        }
+      }
+      result.push({
         deviceId: d.deviceId,
-        label: d.label || (d.kind === 'audioinput' ? `Audio Input ${idx + 1}` : `Audio Output ${idx + 1}`),
-        kind: d.kind as 'audioinput' | 'audiooutput',
+        label,
+        kind: d.kind,
         groupId: d.groupId,
-      }));
+      });
+    }
+    return result;
   }
 
   public connectAsioBridge(
@@ -239,6 +521,122 @@ export class StudioAudioEngine {
     }
   }
 
+  private ensureChannelReverbBranch(ctx: AudioContext, nodes: ChannelNodes, shouldWire: boolean): void {
+    if (shouldWire === Boolean(nodes.reverbBranchWired)) return;
+    if (shouldWire) {
+      if (!nodes.revPreDelay) {
+        nodes.revPreDelay = ctx.createDelay(0.5);
+        nodes.revPreDelay.delayTime.value = 0.07;
+      }
+      if (!nodes.fxConvolver) {
+        nodes.fxConvolver = ctx.createConvolver();
+        nodes.fxConvolver.buffer = createImpulseResponse(ctx, 2.4, 2.3, 4200);
+      }
+      if (!nodes.revWetGain) {
+        nodes.revWetGain = ctx.createGain();
+        nodes.revWetGain.gain.value = 0;
+      }
+      nodes.compressor.connect(nodes.revPreDelay);
+      nodes.revPreDelay.connect(nodes.fxConvolver);
+      nodes.fxConvolver.connect(nodes.revWetGain);
+      nodes.revWetGain.connect(nodes.panner);
+      nodes.reverbBranchWired = true;
+    } else {
+      try {
+        nodes.compressor.disconnect(nodes.revPreDelay!);
+        nodes.revWetGain?.disconnect(nodes.panner);
+      } catch {
+        // ignore if already disconnected
+      }
+      nodes.reverbBranchWired = false;
+    }
+  }
+
+  private ensureChannelDelayBranch(ctx: AudioContext, nodes: ChannelNodes, shouldWire: boolean): void {
+    if (shouldWire === Boolean(nodes.delayBranchWired)) return;
+    if (shouldWire) {
+      if (!nodes.delayWetGain) {
+        nodes.delayWetGain = ctx.createGain();
+        nodes.delayWetGain.gain.value = 0;
+      }
+      if (!nodes.fxDelay) {
+        nodes.fxDelay = ctx.createDelay(2.0);
+        nodes.fxDelay.delayTime.value = 0.5;
+      }
+      if (!nodes.fxFeedback) {
+        nodes.fxFeedback = ctx.createGain();
+        nodes.fxFeedback.gain.value = 0.17;
+      }
+      if (!nodes.fxTone) {
+        nodes.fxTone = ctx.createBiquadFilter();
+        nodes.fxTone.type = 'lowpass';
+        nodes.fxTone.frequency.value = 4470;
+      }
+      nodes.compressor.connect(nodes.fxDelay);
+      nodes.fxDelay.connect(nodes.fxTone);
+      nodes.fxTone.connect(nodes.fxFeedback);
+      nodes.fxFeedback.connect(nodes.fxDelay);
+      nodes.fxTone.connect(nodes.delayWetGain);
+      nodes.delayWetGain.connect(nodes.panner);
+      nodes.delayBranchWired = true;
+    } else {
+      try {
+        nodes.compressor.disconnect(nodes.fxDelay!);
+        nodes.delayWetGain?.disconnect(nodes.panner);
+      } catch {
+        // ignore
+      }
+      nodes.delayBranchWired = false;
+    }
+  }
+
+  private ensureChannelHarmonyBranch(ctx: AudioContext, nodes: ChannelNodes, shouldWire: boolean): void {
+    if (shouldWire === Boolean(nodes.harmonyBranchWired)) return;
+    if (shouldWire) {
+      if (!nodes.harmonyWetGain) {
+        nodes.harmonyWetGain = ctx.createGain();
+        nodes.harmonyWetGain.gain.value = 0;
+      }
+      if (nodes.harmonyVoiceGains.length === 0) {
+        const voiceTimes = [0.009, 0.015, 0.021, 0.027];
+        const voicePans = [-0.35, 0.35, -0.65, 0.65];
+        const voiceLfoHz = [1.1, 1.5, 0.85, 1.85];
+        voiceTimes.forEach((dt, idx) => {
+          const vDelay = ctx.createDelay(0.1);
+          vDelay.delayTime.value = dt;
+          const lfo = ctx.createOscillator();
+          lfo.frequency.value = voiceLfoHz[idx];
+          const lfoDepth = ctx.createGain();
+          lfoDepth.gain.value = 0.0014;
+          lfo.connect(lfoDepth);
+          lfoDepth.connect(vDelay.delayTime);
+          lfo.start();
+
+          const vPan = ctx.createStereoPanner();
+          vPan.pan.value = voicePans[idx];
+          const vGain = ctx.createGain();
+          vGain.gain.value = 0;
+
+          nodes.compressor.connect(vDelay);
+          vDelay.connect(vGain);
+          vGain.connect(vPan);
+          vPan.connect(nodes.harmonyWetGain!);
+          nodes.harmonyVoiceGains.push(vGain);
+          nodes.harmonyLfoOscs.push(lfo);
+        });
+      }
+      nodes.harmonyWetGain.connect(nodes.panner);
+      nodes.harmonyBranchWired = true;
+    } else {
+      try {
+        nodes.harmonyWetGain?.disconnect(nodes.panner);
+      } catch {
+        // ignore
+      }
+      nodes.harmonyBranchWired = false;
+    }
+  }
+
   public rebuildGraph(channels: ChannelState[]): void {
     this.channelsSnapshot = channels;
     if (!this.ctx) return;
@@ -262,43 +660,25 @@ export class StudioAudioEngine {
         highFilter.frequency.value = 6000;
 
         const megaphoneFilter = ctx.createBiquadFilter();
-        megaphoneFilter.type = 'bandpass';
+        megaphoneFilter.type = 'peaking';
         megaphoneFilter.frequency.value = 1450;
-        megaphoneFilter.Q.value = 0.2;
+        megaphoneFilter.Q.value = 1.0;
+        megaphoneFilter.gain.value = 0;
 
         const compressor = ctx.createDynamicsCompressor();
-        const revPreDelay = ctx.createDelay(0.5);
-        revPreDelay.delayTime.value = 0.07;
         const revDryGain = ctx.createGain();
         revDryGain.gain.value = 1;
-        const revWetGain = ctx.createGain();
-        revWetGain.gain.value = 0;
-        const fxConvolver = ctx.createConvolver();
-        fxConvolver.buffer = createImpulseResponse(ctx, 2.4, 2.3, 4200);
-
-        const delayWetGain = ctx.createGain();
-        delayWetGain.gain.value = 0;
-        const chDelay = ctx.createDelay(2.0);
-        chDelay.delayTime.value = 0.5;
-        const chDelayFeedback = ctx.createGain();
-        chDelayFeedback.gain.value = 0.17;
-        const chDelayTone = ctx.createBiquadFilter();
-        chDelayTone.type = 'lowpass';
-        chDelayTone.frequency.value = 4470;
-
-        const harmonyWetGain = ctx.createGain();
-        harmonyWetGain.gain.value = 0;
-        const harmonyVoiceGains: GainNode[] = [];
 
         const panner = ctx.createStereoPanner();
         const faderGain = ctx.createGain();
         const splitter = ctx.createChannelSplitter(2);
         const analyserL = ctx.createAnalyser();
-        analyserL.fftSize = 2048;
+        analyserL.fftSize = ch.type === 'master' ? 2048 : 512;
         analyserL.smoothingTimeConstant = 0.72;
         const analyserR = ctx.createAnalyser();
-        analyserR.fftSize = 2048;
+        analyserR.fftSize = ch.type === 'master' ? 2048 : 512;
         analyserR.smoothingTimeConstant = 0.72;
+        const outputRouterGain = ctx.createGain();
 
         const nodes: ChannelNodes = {
           inputGain,
@@ -307,21 +687,15 @@ export class StudioAudioEngine {
           highFilter,
           megaphoneFilter,
           compressor,
-          revPreDelay,
           revDryGain,
-          revWetGain,
-          delayWetGain,
-          harmonyWetGain,
-          harmonyVoiceGains,
-          fxConvolver,
-          fxDelay: chDelay,
-          fxFeedback: chDelayFeedback,
-          fxTone: chDelayTone,
+          harmonyVoiceGains: [],
+          harmonyLfoOscs: [],
           panner,
           faderGain,
           splitter,
           analyserL,
           analyserR,
+          outputRouterGain,
           sendGains: new Map(),
         };
 
@@ -333,14 +707,23 @@ export class StudioAudioEngine {
           if (isReverb) {
             const revPlugin = ch.inserts.find((i) => i.type === 'reverb');
             const decay = revPlugin?.params.decay ?? 2.5;
+            const fxConvolver = ctx.createConvolver();
             fxConvolver.buffer = createImpulseResponse(ctx, Math.min(5, decay), 2.4, 3600);
+            nodes.fxConvolver = fxConvolver;
             inputGain.connect(fxConvolver);
             fxConvolver.connect(lowFilter);
           } else if (isDelay) {
             const delPlugin = ch.inserts.find((i) => i.type === 'delay');
+            const chDelay = ctx.createDelay(2.0);
             chDelay.delayTime.value = (delPlugin?.params.timeMs ?? 320) / 1000;
+            const chDelayFeedback = ctx.createGain();
             chDelayFeedback.gain.value = Math.min(0.85, (delPlugin?.params.feedback ?? 35) / 100);
+            const chDelayTone = ctx.createBiquadFilter();
+            chDelayTone.type = 'lowpass';
             chDelayTone.frequency.value = delPlugin?.params.tone ?? 3200;
+            nodes.fxDelay = chDelay;
+            nodes.fxFeedback = chDelayFeedback;
+            nodes.fxTone = chDelayTone;
 
             inputGain.connect(chDelay);
             chDelay.connect(chDelayTone);
@@ -359,72 +742,52 @@ export class StudioAudioEngine {
         highFilter.connect(megaphoneFilter);
         megaphoneFilter.connect(compressor);
 
-        // Parallel Wet/Dry Insert Reverb path
+        // Main dry path
         compressor.connect(revDryGain);
         revDryGain.connect(panner);
-        compressor.connect(revPreDelay);
-        revPreDelay.connect(fxConvolver);
-        fxConvolver.connect(revWetGain);
-        revWetGain.connect(panner);
-
-        // Parallel Insert Delay path (active on Ch 5 DELAY or any channel with Beat Delay)
-        if (ch.type !== 'fx') {
-          compressor.connect(chDelay);
-          chDelay.connect(chDelayTone);
-          chDelayTone.connect(chDelayFeedback);
-          chDelayFeedback.connect(chDelay);
-          chDelayTone.connect(delayWetGain);
-          delayWetGain.connect(panner);
-
-          // 4-voice Stereo Harmony / Pitch-Chorus Ensemble taps
-          const voiceTimes = [0.009, 0.015, 0.021, 0.027];
-          const voicePans = [-0.35, 0.35, -0.65, 0.65];
-          const voiceLfoHz = [1.1, 1.5, 0.85, 1.85];
-          voiceTimes.forEach((dt, idx) => {
-            const vDelay = ctx.createDelay(0.1);
-            vDelay.delayTime.value = dt;
-            const lfo = ctx.createOscillator();
-            lfo.frequency.value = voiceLfoHz[idx];
-            const lfoDepth = ctx.createGain();
-            lfoDepth.gain.value = 0.0014;
-            lfo.connect(lfoDepth);
-            lfoDepth.connect(vDelay.delayTime);
-            lfo.start();
-
-            const vPan = ctx.createStereoPanner();
-            vPan.pan.value = voicePans[idx];
-            const vGain = ctx.createGain();
-            vGain.gain.value = 0;
-
-            compressor.connect(vDelay);
-            vDelay.connect(vGain);
-            vGain.connect(vPan);
-            vPan.connect(harmonyWetGain);
-            harmonyVoiceGains.push(vGain);
-          });
-          harmonyWetGain.connect(panner);
-        }
 
         panner.connect(faderGain);
 
         faderGain.connect(splitter);
         splitter.connect(analyserL, 0);
         splitter.connect(analyserR, 1);
+        faderGain.connect(outputRouterGain);
 
-        // Master metering FFT
+        // Master metering FFT & hardware destination gate
         if (ch.type === 'master') {
-          analyserL.fftSize = 2048;
           this.fftBuf = new Uint8Array(analyserL.frequencyBinCount);
           this.recordDest = ctx.createMediaStreamDestination();
-          faderGain.connect(ctx.destination);
+          this.masterOutputGain = ctx.createGain();
+          const masterEnabled = this.masterOutputEnabled && ch.outputTargetType !== 'none';
+          this.masterOutputGain.gain.value = masterEnabled ? 1 : 0;
+          outputRouterGain.connect(this.masterOutputGain);
+          this.masterOutputGain.connect(ctx.destination);
           faderGain.connect(this.recordDest);
         }
 
         this.channelNodes.set(ch.id, nodes);
       }
+
+      // Lazily attach/detach heavy parallel FX branches only when enabled on non-fx strips
+      const nodes = this.channelNodes.get(ch.id);
+      if (nodes && ch.type !== 'fx') {
+        const needsReverb = ch.inserts.some((i) => i.type === 'reverb' && i.enabled);
+        const needsDelay = ch.inserts.some((i) => i.type === 'delay' && i.enabled);
+        const needsHarmony = ch.inserts.some((i) => i.type === 'harmony' && i.enabled);
+        this.ensureChannelReverbBranch(ctx, nodes, needsReverb);
+        this.ensureChannelDelayBranch(ctx, nodes, needsDelay);
+        this.ensureChannelHarmonyBranch(ctx, nodes, needsHarmony);
+      }
     }
 
-    // Ensure internal FX Send buses exist (REVERB, HALL, DELAY) even when hidden from mixer
+    // Lazily create internal FX Send buses only if any channel send actually targets them
+    const referencedBusIds = new Set<string>();
+    for (const ch of channels) {
+      for (const s of ch.sends) {
+        if (s.enabled) referencedBusIds.add(s.targetBusId);
+      }
+    }
+
     const internalFxDefs = [
       { id: 'fx-reverb-internal', mode: 'reverb', decay: 2.4 },
       { id: 'fx-hall-internal', mode: 'reverb', decay: 4.0 },
@@ -434,7 +797,7 @@ export class StudioAudioEngine {
     const masterNode = this.channelNodes.get('main-bus');
     if (masterNode) {
       for (const fxDef of internalFxDefs) {
-        if (!this.channelNodes.has(fxDef.id)) {
+        if (referencedBusIds.has(fxDef.id) && !this.channelNodes.has(fxDef.id)) {
           const inputGain = ctx.createGain();
           const lowFilter = ctx.createBiquadFilter();
           lowFilter.type = 'highpass';
@@ -442,19 +805,19 @@ export class StudioAudioEngine {
           const midFilter = ctx.createBiquadFilter();
           const highFilter = ctx.createBiquadFilter();
           const megaphoneFilter = ctx.createBiquadFilter();
-          megaphoneFilter.type = 'allpass';
+          megaphoneFilter.type = 'peaking';
+          megaphoneFilter.gain.value = 0;
           const compressor = ctx.createDynamicsCompressor();
-          const revPreDelay = ctx.createDelay(0.5);
           const revDryGain = ctx.createGain();
-          const revWetGain = ctx.createGain();
-          const delayWetGain = ctx.createGain();
-          const harmonyWetGain = ctx.createGain();
           const panner = ctx.createStereoPanner();
           const faderGain = ctx.createGain();
           faderGain.gain.value = 0.7;
           const splitter = ctx.createChannelSplitter(2);
           const analyserL = ctx.createAnalyser();
+          analyserL.fftSize = 512;
           const analyserR = ctx.createAnalyser();
+          analyserR.fftSize = 512;
+          const outputRouterGain = ctx.createGain();
 
           if (fxDef.mode === 'reverb') {
             const conv = ctx.createConvolver();
@@ -481,17 +844,15 @@ export class StudioAudioEngine {
             highFilter,
             megaphoneFilter,
             compressor,
-            revPreDelay,
             revDryGain,
-            revWetGain,
-            delayWetGain,
-            harmonyWetGain,
             harmonyVoiceGains: [],
+            harmonyLfoOscs: [],
             panner,
             faderGain,
             splitter,
             analyserL,
             analyserR,
+            outputRouterGain,
             sendGains: new Map(),
           });
         }
@@ -500,13 +861,52 @@ export class StudioAudioEngine {
       for (const ch of channels) {
         const nodes = this.channelNodes.get(ch.id);
         if (!nodes) continue;
-        if (ch.type === 'audio' || ch.type === 'fx') {
-          try {
-            nodes.faderGain.disconnect(masterNode.inputGain);
-          } catch {
-            // not yet connected
+        if (ch.type === 'master') {
+          if (this.masterOutputGain) {
+            const masterEnabled = this.masterOutputEnabled && ch.outputTargetType !== 'none';
+            this.masterOutputGain.gain.setTargetAtTime(masterEnabled ? 1 : 0, ctx.currentTime, 0.008);
           }
-          nodes.faderGain.connect(masterNode.inputGain);
+        } else if (ch.type === 'audio' || ch.type === 'fx' || ch.type === 'listen') {
+          const outType = ch.outputTargetType ?? (ch.type === 'listen' ? 'hardware' : 'master');
+          const outId = ch.outputTargetId ?? (ch.type === 'listen' ? 'default' : 'main-bus');
+          const nextRouteKey = `${outType}:${outId}`;
+
+          // Avoid disconnecting active audio nodes on unrelated fader/pan/DSP updates!
+          if (nodes.outRouteKey !== nextRouteKey) {
+            try {
+              nodes.outputRouterGain.disconnect();
+            } catch {
+              // not yet connected
+            }
+
+            if (outType === 'none') {
+              this.cleanupDirectSink(nodes);
+            } else if (outType === 'hardware') {
+              this.routeChannelToHardwareSink(nodes, outId);
+            } else if (outType === 'bus') {
+              this.cleanupDirectSink(nodes);
+              const targetBus = this.channelNodes.get(outId);
+              if (
+                targetBus &&
+                outId !== ch.id &&
+                !this.wouldCreateOutputCycle(ch.id, outId, channels)
+              ) {
+                nodes.outputRouterGain.connect(targetBus.inputGain);
+              } else if (ch.type === 'listen') {
+                nodes.outputRouterGain.connect(this.masterOutputGain ?? ctx.destination);
+              } else {
+                nodes.outputRouterGain.connect(masterNode.inputGain);
+              }
+            } else {
+              this.cleanupDirectSink(nodes);
+              if (ch.type === 'listen') {
+                nodes.outputRouterGain.connect(this.masterOutputGain ?? ctx.destination);
+              } else {
+                nodes.outputRouterGain.connect(masterNode.inputGain);
+              }
+            }
+            nodes.outRouteKey = nextRouteKey;
+          }
         }
 
         // Clean up removed sends & wire active Sends
@@ -561,6 +961,35 @@ export class StudioAudioEngine {
         (compIns?.params.makeup ?? 0);
       nodes.inputGain.gain.setTargetAtTime(dbToLinear(ch.inputGainDb + extraGainDb) * polaritySign, now, 0.015);
 
+      // Live mic mono/stereo input routing matrix
+      if (nodes.micGainLL && nodes.micGainLR && nodes.micGainRL && nodes.micGainRR) {
+        const micMode = ch.micChannelMode ?? 'mono-lr';
+        let ll = 0.65;
+        let lr = 0.65;
+        let rl = 0.65;
+        let rr = 0.65;
+        if (micMode === 'left') {
+          ll = 1;
+          lr = 1;
+          rl = 0;
+          rr = 0;
+        } else if (micMode === 'right') {
+          ll = 0;
+          lr = 0;
+          rl = 1;
+          rr = 1;
+        } else if (micMode === 'stereo') {
+          ll = 1;
+          lr = 0;
+          rl = 0;
+          rr = 1;
+        }
+        nodes.micGainLL.gain.setTargetAtTime(ll, now, 0.008);
+        nodes.micGainLR.gain.setTargetAtTime(lr, now, 0.008);
+        nodes.micGainRL.gain.setTargetAtTime(rl, now, 0.008);
+        nodes.micGainRR.gain.setTargetAtTime(rr, now, 0.008);
+      }
+
       // EQ inserts
       const eqInsert = ch.inserts.find((i) => (i.type === 'pro-q' || i.type === 'pro-eq') && i.enabled);
       if (eqInsert) {
@@ -574,15 +1003,20 @@ export class StudioAudioEngine {
         nodes.highFilter.gain.setTargetAtTime(0, now, 0.02);
       }
 
-      // Megaphone bandpass insert
+      // Megaphone bandpass insert (unity peaking 0dB when bypassed to avoid phase shift / filter reset clicks)
       const mega = ch.inserts.find((i) => i.type === 'megaphone' && i.enabled);
       if (mega) {
-        nodes.megaphoneFilter.type = 'bandpass';
+        if (nodes.megaphoneFilter.type !== 'bandpass') {
+          nodes.megaphoneFilter.type = 'bandpass';
+        }
         nodes.megaphoneFilter.frequency.setTargetAtTime(mega.params.focusHz ?? 1450, now, 0.02);
         nodes.megaphoneFilter.Q.setTargetAtTime(mega.params.q ?? 2.4, now, 0.02);
       } else {
-        nodes.megaphoneFilter.type = 'allpass';
-        nodes.megaphoneFilter.Q.setTargetAtTime(0.1, now, 0.02);
+        if (nodes.megaphoneFilter.type !== 'peaking') {
+          nodes.megaphoneFilter.type = 'peaking';
+        }
+        nodes.megaphoneFilter.gain.setTargetAtTime(0, now, 0.02);
+        nodes.megaphoneFilter.Q.setTargetAtTime(1.0, now, 0.02);
       }
 
       // Compressor / Limiter / Multiband
@@ -617,7 +1051,7 @@ export class StudioAudioEngine {
       }
 
       // Delay FX / Insert params
-      if (nodes.fxDelay && nodes.fxFeedback && nodes.fxTone) {
+      if (nodes.fxDelay && nodes.fxFeedback && nodes.fxTone && nodes.delayWetGain) {
         const del = ch.inserts.find((i) => i.type === 'delay');
         if (del && del.enabled) {
           nodes.fxDelay.delayTime.setTargetAtTime(
@@ -644,7 +1078,7 @@ export class StudioAudioEngine {
 
       // Reverb Insert wet/dry & pre-delay
       const revIns = ch.inserts.find((i) => i.type === 'reverb' && i.enabled);
-      if (revIns && ch.type !== 'fx') {
+      if (revIns && ch.type !== 'fx' && nodes.revPreDelay && nodes.revWetGain) {
         const mixNorm = Math.max(0, Math.min(1, (revIns.params.mix ?? 100) / 100));
         const preDelaySec = Math.max(0, Math.min(0.45, (revIns.params.preDelay ?? 70) / 1000));
         nodes.revPreDelay.delayTime.setTargetAtTime(preDelaySec, now, 0.006);
@@ -652,21 +1086,25 @@ export class StudioAudioEngine {
         nodes.revWetGain.gain.setTargetAtTime(mixNorm * 0.9, now, 0.006);
       } else {
         nodes.revDryGain.gain.setTargetAtTime(1, now, 0.006);
-        nodes.revWetGain.gain.setTargetAtTime(0, now, 0.006);
+        if (nodes.revWetGain) {
+          nodes.revWetGain.gain.setTargetAtTime(0, now, 0.006);
+        }
       }
 
       // Harmony 1/2/3/4 Voice Insert DSP
       const harmIns = ch.inserts.find((i) => i.type === 'harmony' && i.enabled);
-      if (harmIns && nodes.harmonyVoiceGains.length === 4) {
-        const vCount = Math.max(1, Math.min(4, Math.round(harmIns.params.voiceCount ?? 2)));
-        const hMix = Math.max(0, Math.min(1, (harmIns.params.mix ?? 75) / 100));
-        nodes.harmonyWetGain.gain.setTargetAtTime(hMix * 0.75, now, 0.008);
-        nodes.harmonyVoiceGains.forEach((vg, idx) => {
-          const lvlDb = harmIns.params[`v${idx}_level`] ?? -3;
-          vg.gain.setTargetAtTime(idx < vCount ? dbToLinear(lvlDb) * 0.55 : 0, now, 0.008);
-        });
-      } else {
-        nodes.harmonyWetGain.gain.setTargetAtTime(0, now, 0.008);
+      if (nodes.harmonyWetGain) {
+        if (harmIns && nodes.harmonyVoiceGains.length === 4) {
+          const vCount = Math.max(1, Math.min(4, Math.round(harmIns.params.voiceCount ?? 2)));
+          const hMix = Math.max(0, Math.min(1, (harmIns.params.mix ?? 75) / 100));
+          nodes.harmonyWetGain.gain.setTargetAtTime(hMix * 0.75, now, 0.008);
+          nodes.harmonyVoiceGains.forEach((vg, idx) => {
+            const lvlDb = harmIns.params[`v${idx}_level`] ?? -3;
+            vg.gain.setTargetAtTime(idx < vCount ? dbToLinear(lvlDb) * 0.55 : 0, now, 0.008);
+          });
+        } else {
+          nodes.harmonyWetGain.gain.setTargetAtTime(0, now, 0.008);
+        }
       }
 
       // Pan (-100..100 -> -1..1) with ultra-low-latency smoothing
@@ -692,6 +1130,10 @@ export class StudioAudioEngine {
 
   public async enableLiveMicInput(channelId: string, deviceId?: string, enable = true): Promise<boolean> {
     const ctx = await this.ensureContext();
+    await this.resumeIfNeeded(true);
+    if (!this.channelNodes.has(channelId) && this.channelsSnapshot.length > 0) {
+      this.rebuildGraph(this.channelsSnapshot);
+    }
     const nodes = this.channelNodes.get(channelId);
     if (!nodes) return false;
 
@@ -704,34 +1146,125 @@ export class StudioAudioEngine {
         nodes.micStream.getTracks().forEach((t) => t.stop());
         nodes.micStream = undefined;
       }
+      nodes.micDeviceId = undefined;
       return true;
     }
 
-    try {
-      const lowLatencyConstraints = {
-        deviceId: deviceId && deviceId !== 'default' ? { exact: deviceId } : undefined,
+    if (!navigator.mediaDevices?.getUserMedia) return false;
+
+    const normalizedId =
+      deviceId && deviceId !== 'default' && !deviceId.startsWith('default-')
+        ? deviceId
+        : undefined;
+    const targetKey = normalizedId ?? 'default';
+
+    // Already streaming live from the exact requested device
+    if (
+      nodes.micStream &&
+      nodes.micDeviceId === targetKey &&
+      nodes.micStream.getAudioTracks().some((t) => t.readyState === 'live')
+    ) {
+      nodes.micStream.getAudioTracks().forEach((t) => {
+        t.enabled = true;
+      });
+      await this.resumeIfNeeded(true);
+      this.syncParameters(this.channelsSnapshot);
+      return true;
+    }
+
+    const attempts: MediaStreamConstraints[] = [];
+    if (normalizedId) {
+      attempts.push({
+        audio: {
+          deviceId: { exact: normalizedId },
+          sampleRate: { ideal: ctx.sampleRate },
+          channelCount: { ideal: 2 },
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      });
+      attempts.push({
+        audio: {
+          deviceId: { ideal: normalizedId },
+          sampleRate: { ideal: ctx.sampleRate },
+          channelCount: { ideal: 2 },
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      });
+    }
+    attempts.push({
+      audio: {
+        sampleRate: { ideal: ctx.sampleRate },
+        channelCount: { ideal: 2 },
         echoCancellation: false,
         noiseSuppression: false,
         autoGainControl: false,
-        latency: 0.002,
-      } as MediaTrackConstraints;
+      },
+    });
+    attempts.push({ audio: true });
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: lowLatencyConstraints,
-      });
+    let stream: MediaStream | null = null;
+    for (const constraints of attempts) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        if (stream && stream.getAudioTracks().length > 0) {
+          break;
+        }
+      } catch {
+        stream = null;
+      }
+    }
+
+    if (!stream) return false;
+
+    try {
       if (nodes.micSource) nodes.micSource.disconnect();
       if (nodes.micStream) nodes.micStream.getTracks().forEach((t) => t.stop());
 
+      stream.getAudioTracks().forEach((t) => {
+        t.enabled = true;
+      });
+      if (
+        !nodes.micSplitter ||
+        !nodes.micMerger ||
+        !nodes.micGainLL ||
+        !nodes.micGainLR ||
+        !nodes.micGainRL ||
+        !nodes.micGainRR
+      ) {
+        nodes.micSplitter = ctx.createChannelSplitter(2);
+        nodes.micMerger = ctx.createChannelMerger(2);
+        nodes.micGainLL = ctx.createGain();
+        nodes.micGainLR = ctx.createGain();
+        nodes.micGainRL = ctx.createGain();
+        nodes.micGainRR = ctx.createGain();
+
+        nodes.micSplitter.connect(nodes.micGainLL, 0);
+        nodes.micSplitter.connect(nodes.micGainLR, 0);
+        nodes.micSplitter.connect(nodes.micGainRL, 1);
+        nodes.micSplitter.connect(nodes.micGainRR, 1);
+
+        nodes.micGainLL.connect(nodes.micMerger, 0, 0);
+        nodes.micGainRL.connect(nodes.micMerger, 0, 0);
+        nodes.micGainLR.connect(nodes.micMerger, 0, 1);
+        nodes.micGainRR.connect(nodes.micMerger, 0, 1);
+
+        nodes.micMerger.connect(nodes.inputGain);
+      }
+
       const src = ctx.createMediaStreamSource(stream);
-      src.connect(nodes.inputGain);
+      src.connect(nodes.micSplitter);
       nodes.micSource = src;
       nodes.micStream = stream;
-      if (ctx.state === 'suspended') {
-        await ctx.resume();
-      }
+      nodes.micDeviceId = targetKey;
+      await this.resumeIfNeeded(true);
       this.syncParameters(this.channelsSnapshot);
       return true;
     } catch {
+      stream.getTracks().forEach((t) => t.stop());
       return false;
     }
   }
@@ -747,8 +1280,16 @@ export class StudioAudioEngine {
     onEnded?: () => void
   ): Promise<boolean> {
     const ctx = await this.ensureContext();
+    await this.resumeIfNeeded(true);
+    if (!this.channelNodes.has(channelId) && this.channelsSnapshot.length > 0) {
+      this.rebuildGraph(this.channelsSnapshot);
+    }
     const nodes = this.channelNodes.get(channelId);
-    if (!nodes || !navigator.mediaDevices?.getDisplayMedia) return false;
+    this.lastAppCaptureError = null;
+    if (!nodes || !navigator.mediaDevices?.getDisplayMedia) {
+      this.lastAppCaptureError = 'Browser ini tidak mendukung capture audio aplikasi (getDisplayMedia).';
+      return false;
+    }
 
     try {
       const displayConstraints = {
@@ -763,18 +1304,34 @@ export class StudioAudioEngine {
         suppressLocalAudioPlayback: false,
       } as unknown as DisplayMediaStreamOptions;
 
-      const stream = await navigator.mediaDevices.getDisplayMedia(displayConstraints);
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia(displayConstraints);
+      } catch (firstErr) {
+        const msg = firstErr instanceof Error ? firstErr.message.toLowerCase() : '';
+        const name = firstErr instanceof Error ? firstErr.name : '';
+        if (name === 'NotAllowedError' || name === 'AbortError' || msg.includes('permission') || msg.includes('policy')) {
+          throw firstErr;
+        }
+        stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      }
+
       // Stop unused video tracks; keep only audio stream
       stream.getVideoTracks().forEach((vt) => vt.stop());
       const audioTracks = stream.getAudioTracks();
       if (audioTracks.length === 0) {
         stream.getTracks().forEach((t) => t.stop());
+        this.lastAppCaptureError =
+          'Audio belum ikut terbagikan. Di popup pilih Tab Chrome atau Entire Screen lalu centang "Share audio" / "Share system audio".';
         return false;
       }
 
       if (nodes.micSource) nodes.micSource.disconnect();
       if (nodes.micStream) nodes.micStream.getTracks().forEach((t) => t.stop());
 
+      audioTracks.forEach((t) => {
+        t.enabled = true;
+      });
       const src = ctx.createMediaStreamSource(stream);
       src.connect(nodes.inputGain);
       nodes.micSource = src;
@@ -793,12 +1350,26 @@ export class StudioAudioEngine {
         }
       };
 
-      if (ctx.state === 'suspended') {
-        await ctx.resume();
-      }
+      await this.resumeIfNeeded(true);
       this.syncParameters(this.channelsSnapshot);
       return true;
-    } catch {
+    } catch (err) {
+      const errName = err instanceof Error ? err.name : '';
+      const errMsg = err instanceof Error ? err.message.toLowerCase() : '';
+      const isFirefox = typeof navigator !== 'undefined' && /firefox/i.test(navigator.userAgent);
+      if (errMsg.includes('permissions policy') || errMsg.includes('disallowed')) {
+        this.lastAppCaptureError =
+          'Capture audio aplikasi diblokir oleh pratinjau iframe. Gunakan File Musik, driver ASIO (VC In 1 + 2), atau buka di tab penuh / .EXE.';
+      } else if (isFirefox) {
+        this.lastAppCaptureError =
+          'Firefox tidak mendukung capture audio tab langsung lewat browser. Gunakan Maono VC In 1 + 2 (arahkan output Firefox ke VC 1/2 di Windows Sound) atau Load File Musik.';
+      } else if (errName === 'NotAllowedError' || errName === 'AbortError') {
+        this.lastAppCaptureError =
+          'Capture audio jendela/aplikasi dibatalkan atau tidak didukung (browser tidak bisa menangkap audio jendela Firefox langsung). Gunakan Maono VC In 1 + 2, Entire Screen + Share audio, atau File Musik.';
+      } else {
+        this.lastAppCaptureError =
+          'Audio aplikasi belum terpilih. Pilih Tab Chrome / Entire Screen + "Share audio", atau gunakan VC In 1 + 2.';
+      }
       return false;
     }
   }
@@ -807,6 +1378,7 @@ export class StudioAudioEngine {
     const buf = this.customBuffers.get(channelId);
     if (!buf) return false;
     const ctx = await this.ensureContext(sampleRate);
+    await this.resumeIfNeeded(true);
     this.rebuildGraph(this.channelsSnapshot);
     const nodes = this.channelNodes.get(channelId);
     if (!nodes) return false;
@@ -846,6 +1418,7 @@ export class StudioAudioEngine {
 
   public async loadAudioFileForChannel(channelId: string, file: File): Promise<{ peaks: number[]; duration: number } | null> {
     const ctx = await this.ensureContext();
+    await this.resumeIfNeeded(true);
     try {
       const arr = await file.arrayBuffer();
       const decoded = await ctx.decodeAudioData(arr);
@@ -875,15 +1448,16 @@ export class StudioAudioEngine {
     asioConfig: AsioDriverConfig
   ): Promise<void> {
     const ctx = await this.ensureContext(asioConfig.sampleRate);
+    await this.resumeIfNeeded(true);
     this.rebuildGraph(channels);
     this.transportSnapshot = transport;
     this.stopScheduler();
 
-    // Launch custom loaded audio files if present
+    // Launch custom loaded audio files if present (skip if already launched via playFileForChannel)
     for (const ch of channels) {
       const buf = this.customBuffers.get(ch.id);
       const nodes = this.channelNodes.get(ch.id);
-      if (buf && nodes && ch.inputSource === 'file') {
+      if (buf && nodes && ch.inputSource === 'file' && ch.monitor && !this.channelFileSources.has(ch.id)) {
         const src = ctx.createBufferSource();
         src.buffer = buf;
         src.loop = transport.isLooping;
@@ -1256,9 +1830,13 @@ export class StudioAudioEngine {
     };
   }
 
-  public async playTestTone(sampleRate: number, outputDeviceId: string): Promise<void> {
+  public async playTestTone(sampleRate: number, outputDeviceId: string): Promise<boolean> {
     const ctx = await this.ensureContext(sampleRate);
+    await this.resumeIfNeeded(true);
     await this.setOutputDevice(outputDeviceId);
+    if (!this.masterOutputEnabled) {
+      return false;
+    }
     const now = ctx.currentTime;
     const osc = ctx.createOscillator();
     const pan = ctx.createStereoPanner();
@@ -1279,10 +1857,11 @@ export class StudioAudioEngine {
 
     osc.connect(pan);
     pan.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(this.masterOutputGain ?? ctx.destination);
 
     osc.start(now);
     osc.stop(now + 0.56);
+    return true;
   }
 
   public async loadSpecialEffectAudio(padId: string, file: File): Promise<string | null> {

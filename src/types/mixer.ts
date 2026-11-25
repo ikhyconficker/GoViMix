@@ -94,6 +94,10 @@ export interface SendSlot {
 
 export type InputSourceType = 'demo' | 'mic' | 'file' | 'bus' | 'app' | 'none';
 
+export type OutputTargetType = 'master' | 'bus' | 'hardware' | 'none';
+
+export type MicChannelMode = 'mono-lr' | 'left' | 'right' | 'stereo';
+
 export interface ChannelState {
   id: string;
   index: number;
@@ -120,6 +124,10 @@ export interface ChannelState {
   inputDeviceId?: string;
   inputLabel?: string;
   audioFileName?: string;
+  micChannelMode?: MicChannelMode;
+  outputTargetType?: OutputTargetType;
+  outputTargetId?: string;
+  outputLabel?: string;
 }
 
 export type AsioDriverMode = 'asio-native-bridge' | 'asio4all-router' | 'webaudio-interactive';
