@@ -1,7 +1,7 @@
 import { AudioDeviceInfo, MicChannelMode } from '../types/mixer';
 
 export function isStereoVirtualInputLabel(label: string): boolean {
-  return /\b(vc|virtual|loopback|stereo\s*mix|cable|vb-audio|voicemeeter|vaio|what\s*u\s*hear|line\s*in|aux)\b/i.test(label);
+  return /\b(vc|virtual|loopback|stereo\s*mix|pencampuran\s*stereo|wave\s*out|cable|vb-audio|voicemeeter|vaio|what\s*u\s*hear|line\s*in|aux|blackhole|soundflower|wave\s*link)\b/i.test(label);
 }
 
 export function inferMicChannelMode(label: string): MicChannelMode {
@@ -22,9 +22,22 @@ export function matchHardwareDeviceForChannelLabel(
 
   const lower = channelLabel.toLowerCase();
 
-  // 2. Maono / Virtual Channel / Loopback pattern matching
-  if (lower.includes('loopback')) {
-    return pool.find((d) => /loopback|stereo\s*mix|what\s*u\s*hear/i.test(d.label));
+  // 2. Virtual Cable / Stereo Mix / Maono VC / Loopback pattern matching
+  if (lower.includes('loopback') || lower.includes('stereo mix') || lower.includes('pencampuran stereo')) {
+    const match = pool.find((d) =>
+      /loopback|stereo\s*mix|pencampuran\s*stereo|what\s*u\s*hear|wave\s*out/i.test(d.label)
+    );
+    if (match) return match;
+  }
+
+  if (lower.includes('cable') || lower.includes('vb-audio')) {
+    const match = pool.find((d) => /cable|vb-audio|virtual\s*audio\s*cable/i.test(d.label));
+    if (match) return match;
+  }
+
+  if (lower.includes('voicemeeter') || lower.includes('vaio')) {
+    const match = pool.find((d) => /voicemeeter|vaio/i.test(d.label));
+    if (match) return match;
   }
 
   if (/\bvc\b/.test(lower) && (lower.includes('3') || lower.includes('4'))) {

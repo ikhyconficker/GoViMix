@@ -5,8 +5,6 @@ import {
   Download,
   Monitor,
   Palette,
-  Play,
-  Square,
   Zap,
 } from 'lucide-react';
 import { AsioDriverConfig, ThemePreset } from '../types/mixer';
@@ -23,8 +21,6 @@ interface TopTransportBarProps {
   cpuMetrics: CpuMonitorMetrics;
   recordedAudioUrl: string | null;
   activeTheme: ThemePreset;
-  isPlaying: boolean;
-  onTogglePlayback: () => void;
   onOpenThemeModal: () => void;
   onOpenAsioModal: () => void;
   onOpenDesktopModal: () => void;
@@ -37,8 +33,6 @@ export const TopTransportBar: React.FC<TopTransportBarProps> = ({
   cpuMetrics,
   recordedAudioUrl,
   activeTheme,
-  isPlaying,
-  onTogglePlayback,
   onOpenThemeModal,
   onOpenAsioModal,
   onOpenDesktopModal,
@@ -66,21 +60,8 @@ export const TopTransportBar: React.FC<TopTransportBarProps> = ({
         </span>
       </div>
 
-      {/* Right: Play/Stop + Recorded Take Download + Theme Settings + PC / .EXE + Low Latency ASIO + CPU Monitor */}
+      {/* Right: Recorded Take Download + Theme Settings + PC / .EXE + Low Latency ASIO + CPU Monitor */}
       <div className="flex items-center gap-2 shrink-0 relative">
-        <button
-          type="button"
-          onClick={onTogglePlayback}
-          title={isPlaying ? 'Stop Demo / File Playback' : 'Play Demo Stem / Track'}
-          className={`px-2.5 py-1.5 rounded border text-[11px] font-semibold flex items-center gap-1.5 whitespace-nowrap transition-colors ${
-            isPlaying
-              ? 'bg-emerald-500/20 hover:bg-emerald-500/30 border-emerald-400/60 text-emerald-300'
-              : 'bg-[#121826] hover:bg-[#1a2234] border-[rgba(var(--theme-neon-rgb),0.45)] text-[var(--theme-neon-soft)]'
-          }`}
-        >
-          {isPlaying ? <Square className="w-3 h-3 fill-current" /> : <Play className="w-3 h-3 fill-current" />}
-          <span>{isPlaying ? 'Stop' : 'Play'}</span>
-        </button>
 
         {recordedAudioUrl && (
           <a

@@ -109,7 +109,7 @@ export default function App() {
               },
             ];
           }
-          // In-memory File AudioBuffers do not persist across browser reloads
+          // In-memory File AudioBuffers and getDisplayMedia streams do not persist across browser reloads
           if (ch.inputSource === 'file') {
             const fallbackDemo = ch.id === 'ch-2' || ch.id === 'ch-3';
             return {
@@ -127,6 +127,7 @@ export default function App() {
             index: idx,
             ...themeColor,
             inserts: nextInserts,
+            monitor: ch.inputSource === 'app' ? false : ch.monitor,
           };
         });
     }
@@ -423,7 +424,10 @@ export default function App() {
         nextMonitor
       );
       if (nextMonitor && !ok) {
-        showTemporaryNotice('Gagal membuka mikrofon. Pastikan izin mikrofon browser diizinkan.');
+        showTemporaryNotice(
+          audioEngine.getLastInputError() ??
+            'Gagal membuka input audio. Pastikan izin mikrofon browser diizinkan.'
+        );
         return;
       }
       if (nextMonitor) {
@@ -497,35 +501,6 @@ export default function App() {
     updateChannel(channelId, (c) => ({ ...c, monitor: nextMonitor }));
   };
 
-  const handleTogglePlayback = async () => {
-    if (transportRef.current.isPlaying) {
-      audioEngine.stopPlayback();
-      for (const ch of channelsRef.current) {
-        audioEngine.stopFileForChannel(ch.id);
-      }
-      setTransport((t) => ({ ...t, isPlaying: false }));
-      return;
-    }
-    const cfg = await ensureOutputReady();
-    let nextChannels = channelsRef.current;
-    const hasMonitoredDemo = nextChannels.some((c) => c.inputSource === 'demo' && c.monitor);
-    if (!hasMonitoredDemo && nextChannels.some((c) => c.inputSource === 'demo')) {
-      nextChannels = nextChannels.map((c) =>
-        c.inputSource === 'demo' ? { ...c, monitor: true, mute: false } : c
-      );
-      channelsRef.current = nextChannels;
-      setChannels(nextChannels);
-    }
-    for (const ch of nextChannels) {
-      if (ch.inputSource === 'file' && ch.monitor) {
-        await audioEngine.playFileForChannel(ch.id, cfg.sampleRate, true);
-      }
-    }
-    const nextT = { ...transportRef.current, isPlaying: true };
-    setTransport(nextT);
-    await audioEngine.startPlayback(nextT, nextChannels, cfg);
-  };
-
   const handleSelectInput = async (
     channelId: string,
     source: InputSourceType,
@@ -558,7 +533,10 @@ export default function App() {
       const targetDev = resolvedDeviceId ?? cfg.inputDeviceId;
       const ok = await audioEngine.enableLiveMicInput(channelId, targetDev, true);
       if (!ok) {
-        showTemporaryNotice('Input audio tidak dapat diakses. Periksa izin mikrofon browser atau ASIO Settings.');
+        showTemporaryNotice(
+          audioEngine.getLastInputError() ??
+            'Input audio tidak dapat diakses. Periksa izin mikrofon browser atau ASIO Settings.'
+        );
         return;
       }
       const devs = await audioEngine.enumerateHardwareDevices(false);
@@ -989,8 +967,6 @@ export default function App() {
         cpuMetrics={cpuMetrics}
         recordedAudioUrl={recordedAudioUrl}
         activeTheme={activeTheme}
-        isPlaying={transport.isPlaying}
-        onTogglePlayback={handleTogglePlayback}
         onOpenThemeModal={() => setShowThemeModal(true)}
         onOpenAsioModal={() => setShowAsioModal(true)}
         onOpenDesktopModal={() => setShowDesktopModal(true)}

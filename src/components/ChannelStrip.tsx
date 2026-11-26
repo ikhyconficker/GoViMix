@@ -984,10 +984,13 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 const virtualMusicInputs = inputDevices.filter((d) =>
                   isStereoVirtualInputLabel(d.label)
                 );
+                const otherInputs = inputDevices.filter(
+                  (d) => !isStereoVirtualInputLabel(d.label)
+                );
                 return (
                   <div className="w-[265px] max-h-80 overflow-y-auto console-scroll bg-[#2a2e33] border border-[#454b52] rounded-[3px] shadow-[0_14px_32px_rgba(0,0,0,0.9)] py-1 -ml-[1px] text-[11px] text-[#e4e8ec]">
                     <div className="px-2.5 py-1 text-[9.5px] font-semibold text-emerald-300 border-b border-white/10">
-                      Audio Firefox / Laptop (Virtual Stereo)
+                      Audio Firefox / Media Player (Virtual Stereo)
                     </div>
 
                     {virtualMusicInputs.length > 0 ? (
@@ -1040,6 +1043,37 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                             </button>
                           )
                         )}
+                      </div>
+                    )}
+
+                    {otherInputs.length > 0 && (
+                      <div className="border-t border-white/10 mt-1 pt-1">
+                        <div className="px-2.5 pb-0.5 text-[9px] text-slate-400">
+                          Perangkat Input Lainnya (Stereo)
+                        </div>
+                        {otherInputs.map((dev) => (
+                          <button
+                            key={dev.deviceId}
+                            type="button"
+                            onClick={() => {
+                              onSelectInput?.(
+                                channel.id,
+                                'mic',
+                                channel.index,
+                                dev.label,
+                                dev.deviceId,
+                                'stereo'
+                              );
+                              setShowInputMenu(false);
+                            }}
+                            className="w-full px-2.5 py-1 hover:bg-[#3e444c] text-left flex items-center justify-between gap-2 text-slate-200"
+                          >
+                            <span className="truncate">{dev.label}</span>
+                            {channel.inputSource === 'mic' && channel.inputDeviceId === dev.deviceId && (
+                              <Check className="w-3 h-3 text-emerald-400 shrink-0" />
+                            )}
+                          </button>
+                        ))}
                       </div>
                     )}
 
@@ -1107,13 +1141,24 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                       Demo Stem (Synth)
                     </button>
 
-                    <div className="mx-2 mt-1 mb-1 p-1.5 rounded bg-[#181b20] border border-white/10 text-[9.5px] leading-snug text-slate-300">
-                      <strong className="text-amber-300">Tips Firefox / Laptop:</strong> Buka{' '}
-                      <span className="text-white">Windows Sound → Volume Mixer</span>, arahkan output{' '}
-                      <span className="text-white">Firefox</span> ke{' '}
-                      <span className="text-emerald-300">CABLE Input / Maono VC 1-2</span> (atau aktifkan{' '}
-                      <span className="text-emerald-300">Stereo Mix</span>), lalu klik{' '}
-                      <span className="text-emerald-300">Scan</span> &amp; pilih di atas.
+                    <div className="mx-2 mt-1 mb-1 p-1.5 rounded bg-[#181b20] border border-white/10 text-[9.5px] leading-snug text-slate-300 space-y-1">
+                      <div>
+                        <strong className="text-amber-300">Routing Firefox / Media Player:</strong>
+                      </div>
+                      <div>
+                        1. Di <span className="text-white">Windows Sound → Volume Mixer</span>, ubah Output{' '}
+                        <span className="text-white">Firefox / Player</span> ke{' '}
+                        <span className="text-emerald-300">CABLE Input / Maono VC 1-2</span> (atau aktifkan{' '}
+                        <span className="text-emerald-300">Stereo Mix</span>).
+                      </div>
+                      <div>
+                        2. Biarkan Output GoViMix tetap ke{' '}
+                        <span className="text-white">Speaker/Headphone</span> agar tidak echo/loopback.
+                      </div>
+                      <div>
+                        3. Klik <span className="text-emerald-300">Scan</span> lalu pilih{' '}
+                        <span className="text-emerald-300">CABLE Output / VC In / Stereo Mix</span> di atas.
+                      </div>
                     </div>
                   </div>
                 );

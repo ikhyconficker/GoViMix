@@ -208,6 +208,7 @@ export class StudioAudioEngine {
   private masterOutputEnabled = true;
   private masterOutputGain: GainNode | null = null;
   private lastOutputError: string | null = null;
+  private lastInputError: string | null = null;
   private lastAppCaptureError: string | null = null;
 
   // ASIO Bridge WebSocket
@@ -354,6 +355,10 @@ export class StudioAudioEngine {
 
   public getLastOutputError(): string | null {
     return this.lastOutputError;
+  }
+
+  public getLastInputError(): string | null {
+    return this.lastInputError;
   }
 
   public getLastAppCaptureError(): string | null {
@@ -2030,7 +2035,11 @@ export class StudioAudioEngine {
       return true;
     }
 
-    if (!navigator.mediaDevices?.getUserMedia) return false;
+    this.lastInputError = null;
+    if (!navigator.mediaDevices?.getUserMedia) {
+      this.lastInputError = 'Browser ini tidak mendukung akses perangkat input audio.';
+      return false;
+    }
 
     const normalizedId =
       deviceId && deviceId !== 'default' && !deviceId.startsWith('default-')
@@ -2066,7 +2075,20 @@ export class StudioAudioEngine {
       });
       attempts.push({
         audio: {
-          deviceId: { ideal: normalizedId },
+          deviceId: { exact: normalizedId },
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      });
+      attempts.push({
+        audio: {
+          deviceId: { exact: normalizedId },
+        },
+      });
+    } else {
+      attempts.push({
+        audio: {
           sampleRate: { ideal: ctx.sampleRate },
           channelCount: { ideal: 2 },
           echoCancellation: false,
@@ -2074,31 +2096,36 @@ export class StudioAudioEngine {
           autoGainControl: false,
         },
       });
+      attempts.push({ audio: true });
     }
-    attempts.push({
-      audio: {
-        sampleRate: { ideal: ctx.sampleRate },
-        channelCount: { ideal: 2 },
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-      },
-    });
-    attempts.push({ audio: true });
 
     let stream: MediaStream | null = null;
+    let lastErr: unknown = null;
     for (const constraints of attempts) {
       try {
         stream = await navigator.mediaDevices.getUserMedia(constraints);
         if (stream && stream.getAudioTracks().length > 0) {
           break;
         }
-      } catch {
+      } catch (err) {
+        lastErr = err;
         stream = null;
       }
     }
 
-    if (!stream) return false;
+    if (!stream) {
+      const errName = lastErr instanceof Error ? lastErr.name : '';
+      if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError') {
+        this.lastInputError = 'Izin mikrofon/input audio diblokir browser. Klik ikon gembok di address bar lalu izinkan Microphone.';
+      } else if (normalizedId && (errName === 'OverconstrainedError' || errName === 'NotFoundError')) {
+        this.lastInputError = 'Perangkat input/virtual audio yang dipilih tidak ditemukan atau sedang dipakai eksklusif oleh aplikasi lain. Klik Scan Perangkat Input.';
+      } else if (errName === 'NotReadableError') {
+        this.lastInputError = 'Perangkat audio gagal dibuka (sedang dipakai mode Exclusive oleh driver ASIO/aplikasi lain).';
+      } else {
+        this.lastInputError = 'Input audio tidak dapat diakses. Periksa izin mikrofon browser atau pengaturan Sound Windows.';
+      }
+      return false;
+    }
 
     try {
       if (nodes.micSource) nodes.micSource.disconnect();
