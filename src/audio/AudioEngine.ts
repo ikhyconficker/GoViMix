@@ -7,30 +7,114 @@ import {
   SpecialEffectPreset,
   TransportState,
 } from '../types/mixer';
+import { ensureGoViMixWorklets } from './govimixWorklet';
+
+const DELAY_BEAT_MULTS = [0.25, 0.333333, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0];
+const PONG_FACTOR_MULTS = [0.5, 0.666667, 1.0, 1.5, 2.0];
 
 interface ChannelNodes {
   inputGain: GainNode;
-  lowFilter: BiquadFilterNode;
-  midFilter: BiquadFilterNode;
-  highFilter: BiquadFilterNode;
+  // Full 7-band Parametric EQ + Low/High Cut + Output Gain
+  eqLowCut1: BiquadFilterNode;
+  eqLowCut2: BiquadFilterNode;
+  eqLlcFilter: BiquadFilterNode;
+  eqLfFilter: BiquadFilterNode;
+  eqLmfFilter: BiquadFilterNode;
+  eqMfFilter: BiquadFilterNode;
+  eqHmfFilter: BiquadFilterNode;
+  eqHfFilter: BiquadFilterNode;
+  eqHighCut1: BiquadFilterNode;
+  eqHighCut2: BiquadFilterNode;
+  eqSoloFilter: BiquadFilterNode;
+  eqOutGain: GainNode;
+  // Gate AudioWorklet (lazy)
+  postGateGain: GainNode;
+  gateNode?: AudioWorkletNode;
+  gateWired?: boolean;
+  // Saturation AudioWorklet (lazy)
+  postSatGain: GainNode;
+  saturationNode?: AudioWorkletNode;
+  saturationWired?: boolean;
+  // Megaphone & Compressor Stage
   megaphoneFilter: BiquadFilterNode;
+  compDryGain: GainNode;
+  compDriveGain: GainNode;
   compressor: DynamicsCompressorNode;
+  compMakeupGain: GainNode;
+  compWetGain: GainNode;
+  compSumGain: GainNode;
+  // Multiband Compressor AudioWorklet (lazy)
+  postMbGain: GainNode;
+  multibandNode?: AudioWorkletNode;
+  multibandWired?: boolean;
+  // Sidechain Ducking AudioWorklet (lazy)
+  postDuckGain: GainNode;
+  duckingNode?: AudioWorkletNode;
+  duckingWired?: boolean;
+  duckingKeyChId?: string;
+  // Wider Stereo Imager Matrix (lazy)
+  postWiderGain: GainNode;
+  widerSplitter?: ChannelSplitterNode;
+  widerMerger?: ChannelMergerNode;
+  widerLL?: GainNode;
+  widerLR?: GainNode;
+  widerRL?: GainNode;
+  widerRR?: GainNode;
+  widerWired?: boolean;
+  // Harmony AudioWorklet + Formant Filter (lazy)
+  harmonyFormantFilter?: BiquadFilterNode;
+  harmonyNode?: AudioWorkletNode;
+  harmonyWired?: boolean;
+  // Reverb Parallel/Bus Branch
   revPreDelay?: DelayNode;
+  fxConvolver?: ConvolverNode;
+  revDampFilter?: BiquadFilterNode;
+  revGateNode?: AudioWorkletNode;
+  revWidthSplitter?: ChannelSplitterNode;
+  revWidthMerger?: ChannelMergerNode;
+  revWidthLL?: GainNode;
+  revWidthLR?: GainNode;
+  revWidthRL?: GainNode;
+  revWidthRR?: GainNode;
   revDryGain: GainNode;
   revWetGain?: GainNode;
+  revIrSize?: number;
+  revIrDamping?: number;
+  revIrTimer?: number;
+  // Stereo Ping-Pong Delay Branch
+  delayInPan?: StereoPannerNode;
+  delayInSplitter?: ChannelSplitterNode;
+  delayInLL?: GainNode;
+  delayInLR?: GainNode;
+  delayInRL?: GainNode;
+  delayInRR?: GainNode;
+  delayNodeL?: DelayNode;
+  delayNodeR?: DelayNode;
+  delayLoCutL?: BiquadFilterNode;
+  delayLoCutR?: BiquadFilterNode;
+  delayHiCutL?: BiquadFilterNode;
+  delayHiCutR?: BiquadFilterNode;
+  delayFbLL?: GainNode;
+  delayFbLR?: GainNode;
+  delayFbRL?: GainNode;
+  delayFbRR?: GainNode;
+  delayOutMerger?: ChannelMergerNode;
+  delayWidthSplitter?: ChannelSplitterNode;
+  delayWidthMerger?: ChannelMergerNode;
+  delayWidthLL?: GainNode;
+  delayWidthLR?: GainNode;
+  delayWidthRL?: GainNode;
+  delayWidthRR?: GainNode;
   delayWetGain?: GainNode;
-  harmonyWetGain?: GainNode;
-  harmonyVoiceGains: GainNode[];
-  harmonyLfoOscs: OscillatorNode[];
-  panner: StereoPannerNode;
-  faderGain: GainNode;
-  fxConvolver?: ConvolverNode;
+  // Legacy refs kept optional for internal FX buses
   fxDelay?: DelayNode;
   fxFeedback?: GainNode;
   fxTone?: BiquadFilterNode;
   reverbBranchWired?: boolean;
   delayBranchWired?: boolean;
-  harmonyBranchWired?: boolean;
+  // Output & Metering
+  panner: StereoPannerNode;
+  faderGain: GainNode;
   splitter: ChannelSplitterNode;
   analyserL: AnalyserNode;
   analyserR: AnalyserNode;
@@ -70,12 +154,15 @@ function createImpulseResponse(
   const sampleRate = ctx.sampleRate;
   const length = Math.max(1, Math.floor(sampleRate * durationSec));
   const impulse = ctx.createBuffer(2, length, sampleRate);
+  const alpha = Math.min(0.98, Math.max(0.06, (2 * Math.PI * dampingHz) / (sampleRate + 2 * Math.PI * dampingHz)));
   for (let ch = 0; ch < 2; ch++) {
     const data = impulse.getChannelData(ch);
     let lp = 0;
-    const alpha = Math.min(0.98, Math.max(0.1, dampingHz / sampleRate * 4));
     for (let i = 0; i < length; i++) {
-      const n = (Math.random() * 2 - 1) * Math.pow(1 - i / length, decay);
+      const env = Math.pow(1 - i / length, decay);
+      // Slight early-reflection burst in first 35ms for realism
+      const er = i < sampleRate * 0.035 && i % 211 === 0 ? 1.45 : 1;
+      const n = (Math.random() * 2 - 1) * env * er;
       lp = lp + alpha * (n - lp);
       data[i] = lp;
     }
@@ -85,7 +172,12 @@ function createImpulseResponse(
 
 export class StudioAudioEngine {
   private ctx: AudioContext | null = null;
+  private workletsReady = false;
   private channelNodes = new Map<string, ChannelNodes>();
+  private gateAttenMap = new Map<string, number>();
+  private compMixMap = new Map<string, number>();
+  private satMetricsMap = new Map<string, { driveDb: number; satAmount: number; inRmsDb: number; outRmsDb: number }>();
+  private duckDbMap = new Map<string, number>();
   private customBuffers = new Map<string, AudioBuffer>();
   private channelFileSources = new Map<string, AudioBufferSourceNode>();
   private sfxBuffers = new Map<string, AudioBuffer>();
@@ -100,6 +192,9 @@ export class StudioAudioEngine {
   private timeBufL = new Float32Array(256);
   private timeBufR = new Float32Array(256);
   private fftBuf = new Uint8Array(1024);
+  private floatFftBufL = new Float32Array(4096);
+  private floatFftBufR = new Float32Array(4096);
+  private floatFftBufOut = new Float32Array(4096);
 
   // Recording state
   private mediaRecorder: MediaRecorder | null = null;
@@ -153,7 +248,17 @@ export class StudioAudioEngine {
           latencyHint,
         });
       }
+      const createdCtx = this.ctx;
+      this.workletsReady = false;
       this.appliedSinkId = '';
+      void ensureGoViMixWorklets(createdCtx).then((ok) => {
+        if (ok && this.ctx === createdCtx) {
+          this.workletsReady = true;
+          if (this.channelsSnapshot.length > 0) {
+            this.rebuildGraph(this.channelsSnapshot);
+          }
+        }
+      });
       if (this.channelsSnapshot.length > 0) {
         this.rebuildGraph(this.channelsSnapshot);
       }
@@ -198,15 +303,10 @@ export class StudioAudioEngine {
     }
     for (const nodes of this.channelNodes.values()) {
       this.cleanupDirectSink(nodes);
-      for (const osc of nodes.harmonyLfoOscs) {
-        try {
-          osc.stop();
-          osc.disconnect();
-        } catch {
-          // ignore
-        }
+      if (nodes.revIrTimer !== undefined) {
+        window.clearTimeout(nodes.revIrTimer);
+        nodes.revIrTimer = undefined;
       }
-      nodes.harmonyLfoOscs = [];
       if (nodes.micSource) {
         try {
           nodes.micSource.disconnect();
@@ -224,11 +324,15 @@ export class StudioAudioEngine {
     if (this.ctx) {
       await this.ctx.close();
       this.ctx = null;
+      this.workletsReady = false;
       this.channelNodes.clear();
       this.masterOutputGain = null;
       this.appliedSinkId = '';
     }
     const ctx = await this.ensureContext(sampleRate, this.currentBufferSize);
+    await ensureGoViMixWorklets(ctx).then((ok) => {
+      if (ok && this.ctx === ctx) this.workletsReady = true;
+    });
     await this.resumeIfNeeded(true);
     this.rebuildGraph(channels);
     await this.setOutputDevice(this.currentOutputDeviceId);
@@ -521,6 +625,199 @@ export class StudioAudioEngine {
     }
   }
 
+  private ensureChannelGateNode(ctx: AudioContext, chId: string, nodes: ChannelNodes): void {
+    if (nodes.gateWired || !this.workletsReady) return;
+    try {
+      const gateNode = new AudioWorkletNode(ctx, 'govimix-gate-processor', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [2],
+      });
+      gateNode.port.onmessage = (ev) => {
+        if (typeof ev.data?.attenDb === 'number') {
+          this.gateAttenMap.set(chId, ev.data.attenDb);
+        }
+      };
+      try {
+        nodes.eqOutGain.disconnect(nodes.postGateGain);
+      } catch {
+        // ignore
+      }
+      nodes.eqOutGain.connect(gateNode);
+      gateNode.connect(nodes.postGateGain);
+      nodes.gateNode = gateNode;
+      nodes.gateWired = true;
+    } catch {
+      // worklet not available; keep direct connection
+    }
+  }
+
+  private ensureChannelSaturationNode(ctx: AudioContext, chId: string, nodes: ChannelNodes): void {
+    if (nodes.saturationWired || !this.workletsReady) return;
+    try {
+      const satNode = new AudioWorkletNode(ctx, 'govimix-saturation-processor', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [2],
+      });
+      satNode.port.onmessage = (ev) => {
+        if (ev.data && typeof ev.data.driveDb === 'number') {
+          this.satMetricsMap.set(chId, {
+            driveDb: ev.data.driveDb,
+            satAmount: ev.data.satAmount ?? 0,
+            inRmsDb: ev.data.inRmsDb ?? -60,
+            outRmsDb: ev.data.outRmsDb ?? -60,
+          });
+        }
+      };
+      try {
+        nodes.postGateGain.disconnect(nodes.postSatGain);
+      } catch {
+        // ignore
+      }
+      nodes.postGateGain.connect(satNode);
+      satNode.connect(nodes.postSatGain);
+      nodes.saturationNode = satNode;
+      nodes.saturationWired = true;
+    } catch {
+      // worklet not available; keep direct connection
+    }
+  }
+
+  private ensureChannelMultibandNode(ctx: AudioContext, nodes: ChannelNodes): void {
+    if (nodes.multibandWired || !this.workletsReady) return;
+    try {
+      const mbNode = new AudioWorkletNode(ctx, 'govimix-multiband-processor', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [2],
+      });
+      try {
+        nodes.compSumGain.disconnect(nodes.postMbGain);
+      } catch {
+        // ignore
+      }
+      nodes.compSumGain.connect(mbNode);
+      mbNode.connect(nodes.postMbGain);
+      nodes.multibandNode = mbNode;
+      nodes.multibandWired = true;
+    } catch {
+      // keep direct connection
+    }
+  }
+
+  private ensureChannelDuckingNode(ctx: AudioContext, chId: string, nodes: ChannelNodes): void {
+    if (!this.workletsReady) return;
+    if (!nodes.duckingWired) {
+      try {
+        const duckNode = new AudioWorkletNode(ctx, 'govimix-ducking-processor', {
+          numberOfInputs: 2,
+          numberOfOutputs: 1,
+          outputChannelCount: [2],
+        });
+        duckNode.port.onmessage = (ev) => {
+          if (typeof ev.data?.duckDb === 'number') {
+            this.duckDbMap.set(chId, ev.data.duckDb);
+          }
+        };
+        try {
+          nodes.postMbGain.disconnect(nodes.postDuckGain);
+        } catch {
+          // ignore
+        }
+        nodes.postMbGain.connect(duckNode, 0, 0);
+        duckNode.connect(nodes.postDuckGain);
+        nodes.duckingNode = duckNode;
+        nodes.duckingWired = true;
+      } catch {
+        return;
+      }
+    }
+
+    // Connect VOCAL (ch-3) post-EQ/gate signal as sidechain key into input 1
+    if (nodes.duckingNode && chId !== 'ch-3') {
+      const vocalNodes = this.channelNodes.get('ch-3');
+      if (vocalNodes && nodes.duckingKeyChId !== 'ch-3') {
+        try {
+          vocalNodes.postGateGain.connect(nodes.duckingNode, 0, 1);
+          nodes.duckingKeyChId = 'ch-3';
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  private ensureChannelWiderMatrix(ctx: AudioContext, nodes: ChannelNodes): void {
+    if (nodes.widerWired) return;
+    const splitter = ctx.createChannelSplitter(2);
+    const merger = ctx.createChannelMerger(2);
+    const ll = ctx.createGain();
+    const lr = ctx.createGain();
+    const rl = ctx.createGain();
+    const rr = ctx.createGain();
+    ll.gain.value = 1;
+    rr.gain.value = 1;
+    lr.gain.value = 0;
+    rl.gain.value = 0;
+
+    try {
+      nodes.postDuckGain.disconnect(nodes.postWiderGain);
+    } catch {
+      // ignore
+    }
+    nodes.postDuckGain.connect(splitter);
+    splitter.connect(ll, 0);
+    splitter.connect(lr, 0);
+    splitter.connect(rl, 1);
+    splitter.connect(rr, 1);
+
+    ll.connect(merger, 0, 0);
+    rl.connect(merger, 0, 0);
+    lr.connect(merger, 0, 1);
+    rr.connect(merger, 0, 1);
+    merger.connect(nodes.postWiderGain);
+
+    nodes.widerSplitter = splitter;
+    nodes.widerMerger = merger;
+    nodes.widerLL = ll;
+    nodes.widerLR = lr;
+    nodes.widerRL = rl;
+    nodes.widerRR = rr;
+    nodes.widerWired = true;
+  }
+
+  private ensureChannelHarmonyNode(ctx: AudioContext, nodes: ChannelNodes): void {
+    if (nodes.harmonyWired || !this.workletsReady) return;
+    try {
+      const formantFilter = ctx.createBiquadFilter();
+      formantFilter.type = 'peaking';
+      formantFilter.frequency.value = 1850;
+      formantFilter.Q.value = 0.85;
+      formantFilter.gain.value = 0;
+
+      const harmonyNode = new AudioWorkletNode(ctx, 'govimix-harmony-processor', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [2],
+      });
+
+      try {
+        nodes.postWiderGain.disconnect(nodes.revDryGain);
+      } catch {
+        // ignore
+      }
+      nodes.postWiderGain.connect(formantFilter);
+      formantFilter.connect(harmonyNode);
+      harmonyNode.connect(nodes.revDryGain);
+      nodes.harmonyFormantFilter = formantFilter;
+      nodes.harmonyNode = harmonyNode;
+      nodes.harmonyWired = true;
+    } catch {
+      // worklet not available; keep direct connection
+    }
+  }
+
   private ensureChannelReverbBranch(ctx: AudioContext, nodes: ChannelNodes, shouldWire: boolean): void {
     if (shouldWire === Boolean(nodes.reverbBranchWired)) return;
     if (shouldWire) {
@@ -530,20 +827,70 @@ export class StudioAudioEngine {
       }
       if (!nodes.fxConvolver) {
         nodes.fxConvolver = ctx.createConvolver();
-        nodes.fxConvolver.buffer = createImpulseResponse(ctx, 2.4, 2.3, 4200);
+        nodes.fxConvolver.buffer = createImpulseResponse(ctx, 4.0, 2.5, 16000);
+        nodes.revIrSize = 80;
+        nodes.revIrDamping = 0;
+      }
+      if (!nodes.revDampFilter) {
+        nodes.revDampFilter = ctx.createBiquadFilter();
+        nodes.revDampFilter.type = 'lowpass';
+        nodes.revDampFilter.frequency.value = 18000;
+      }
+      if (!nodes.revWidthSplitter) {
+        nodes.revWidthSplitter = ctx.createChannelSplitter(2);
+        nodes.revWidthMerger = ctx.createChannelMerger(2);
+        nodes.revWidthLL = ctx.createGain();
+        nodes.revWidthLR = ctx.createGain();
+        nodes.revWidthRL = ctx.createGain();
+        nodes.revWidthRR = ctx.createGain();
+        nodes.revWidthLL.gain.value = 1;
+        nodes.revWidthRR.gain.value = 1;
+        nodes.revWidthLR.gain.value = 0;
+        nodes.revWidthRL.gain.value = 0;
+
+        nodes.revWidthSplitter.connect(nodes.revWidthLL, 0);
+        nodes.revWidthSplitter.connect(nodes.revWidthLR, 0);
+        nodes.revWidthSplitter.connect(nodes.revWidthRL, 1);
+        nodes.revWidthSplitter.connect(nodes.revWidthRR, 1);
+
+        nodes.revWidthLL.connect(nodes.revWidthMerger, 0, 0);
+        nodes.revWidthRL.connect(nodes.revWidthMerger, 0, 0);
+        nodes.revWidthLR.connect(nodes.revWidthMerger, 0, 1);
+        nodes.revWidthRR.connect(nodes.revWidthMerger, 0, 1);
       }
       if (!nodes.revWetGain) {
         nodes.revWetGain = ctx.createGain();
         nodes.revWetGain.gain.value = 0;
       }
-      nodes.compressor.connect(nodes.revPreDelay);
+
+      nodes.postWiderGain.connect(nodes.revPreDelay);
       nodes.revPreDelay.connect(nodes.fxConvolver);
-      nodes.fxConvolver.connect(nodes.revWetGain);
+      nodes.fxConvolver.connect(nodes.revDampFilter);
+
+      if (this.workletsReady && !nodes.revGateNode) {
+        try {
+          nodes.revGateNode = new AudioWorkletNode(ctx, 'govimix-gate-processor', {
+            numberOfInputs: 1,
+            numberOfOutputs: 1,
+            outputChannelCount: [2],
+          });
+        } catch {
+          nodes.revGateNode = undefined;
+        }
+      }
+
+      if (nodes.revGateNode) {
+        nodes.revDampFilter.connect(nodes.revGateNode);
+        nodes.revGateNode.connect(nodes.revWidthSplitter);
+      } else {
+        nodes.revDampFilter.connect(nodes.revWidthSplitter);
+      }
+      nodes.revWidthMerger!.connect(nodes.revWetGain);
       nodes.revWetGain.connect(nodes.panner);
       nodes.reverbBranchWired = true;
     } else {
       try {
-        nodes.compressor.disconnect(nodes.revPreDelay!);
+        nodes.postWiderGain.disconnect(nodes.revPreDelay!);
         nodes.revWetGain?.disconnect(nodes.panner);
       } catch {
         // ignore if already disconnected
@@ -555,33 +902,99 @@ export class StudioAudioEngine {
   private ensureChannelDelayBranch(ctx: AudioContext, nodes: ChannelNodes, shouldWire: boolean): void {
     if (shouldWire === Boolean(nodes.delayBranchWired)) return;
     if (shouldWire) {
-      if (!nodes.delayWetGain) {
+      if (!nodes.delayInPan) {
+        nodes.delayInPan = ctx.createStereoPanner();
+        nodes.delayInSplitter = ctx.createChannelSplitter(2);
+        nodes.delayInLL = ctx.createGain();
+        nodes.delayInLR = ctx.createGain();
+        nodes.delayInRL = ctx.createGain();
+        nodes.delayInRR = ctx.createGain();
+        nodes.delayNodeL = ctx.createDelay(2.5);
+        nodes.delayNodeR = ctx.createDelay(2.5);
+        nodes.delayLoCutL = ctx.createBiquadFilter();
+        nodes.delayLoCutL.type = 'highpass';
+        nodes.delayLoCutL.frequency.value = 140;
+        nodes.delayLoCutR = ctx.createBiquadFilter();
+        nodes.delayLoCutR.type = 'highpass';
+        nodes.delayLoCutR.frequency.value = 140;
+        nodes.delayHiCutL = ctx.createBiquadFilter();
+        nodes.delayHiCutL.type = 'lowpass';
+        nodes.delayHiCutL.frequency.value = 4470;
+        nodes.delayHiCutR = ctx.createBiquadFilter();
+        nodes.delayHiCutR.type = 'lowpass';
+        nodes.delayHiCutR.frequency.value = 4470;
+        nodes.delayFbLL = ctx.createGain();
+        nodes.delayFbLR = ctx.createGain();
+        nodes.delayFbRL = ctx.createGain();
+        nodes.delayFbRR = ctx.createGain();
+        nodes.delayOutMerger = ctx.createChannelMerger(2);
+
+        nodes.delayWidthSplitter = ctx.createChannelSplitter(2);
+        nodes.delayWidthMerger = ctx.createChannelMerger(2);
+        nodes.delayWidthLL = ctx.createGain();
+        nodes.delayWidthLR = ctx.createGain();
+        nodes.delayWidthRL = ctx.createGain();
+        nodes.delayWidthRR = ctx.createGain();
+        nodes.delayWidthLL.gain.value = 1;
+        nodes.delayWidthRR.gain.value = 1;
+        nodes.delayWidthLR.gain.value = 0;
+        nodes.delayWidthRL.gain.value = 0;
         nodes.delayWetGain = ctx.createGain();
         nodes.delayWetGain.gain.value = 0;
+
+        // Input routing matrix
+        nodes.delayInPan.connect(nodes.delayInSplitter);
+        nodes.delayInSplitter.connect(nodes.delayInLL, 0);
+        nodes.delayInSplitter.connect(nodes.delayInLR, 0);
+        nodes.delayInSplitter.connect(nodes.delayInRL, 1);
+        nodes.delayInSplitter.connect(nodes.delayInRR, 1);
+
+        nodes.delayInLL.connect(nodes.delayNodeL);
+        nodes.delayInRL.connect(nodes.delayNodeL);
+        nodes.delayInLR.connect(nodes.delayNodeR);
+        nodes.delayInRR.connect(nodes.delayNodeR);
+
+        // Filters on L & R taps
+        nodes.delayNodeL.connect(nodes.delayLoCutL);
+        nodes.delayLoCutL.connect(nodes.delayHiCutL);
+        nodes.delayNodeR.connect(nodes.delayLoCutR);
+        nodes.delayLoCutR.connect(nodes.delayHiCutR);
+
+        // Feedback cross matrix
+        nodes.delayHiCutL.connect(nodes.delayFbLL);
+        nodes.delayHiCutL.connect(nodes.delayFbLR);
+        nodes.delayHiCutR.connect(nodes.delayFbRL);
+        nodes.delayHiCutR.connect(nodes.delayFbRR);
+
+        nodes.delayFbLL.connect(nodes.delayNodeL);
+        nodes.delayFbRL.connect(nodes.delayNodeL);
+        nodes.delayFbLR.connect(nodes.delayNodeR);
+        nodes.delayFbRR.connect(nodes.delayNodeR);
+
+        // Out + Stereo Width Matrix
+        nodes.delayHiCutL.connect(nodes.delayOutMerger, 0, 0);
+        nodes.delayHiCutR.connect(nodes.delayOutMerger, 0, 1);
+        nodes.delayOutMerger.connect(nodes.delayWidthSplitter);
+
+        nodes.delayWidthSplitter.connect(nodes.delayWidthLL, 0);
+        nodes.delayWidthSplitter.connect(nodes.delayWidthLR, 0);
+        nodes.delayWidthSplitter.connect(nodes.delayWidthRL, 1);
+        nodes.delayWidthSplitter.connect(nodes.delayWidthRR, 1);
+
+        nodes.delayWidthLL.connect(nodes.delayWidthMerger, 0, 0);
+        nodes.delayWidthRL.connect(nodes.delayWidthMerger, 0, 0);
+        nodes.delayWidthLR.connect(nodes.delayWidthMerger, 0, 1);
+        nodes.delayWidthRR.connect(nodes.delayWidthMerger, 0, 1);
+
+        nodes.delayWidthMerger.connect(nodes.delayWetGain);
       }
-      if (!nodes.fxDelay) {
-        nodes.fxDelay = ctx.createDelay(2.0);
-        nodes.fxDelay.delayTime.value = 0.5;
-      }
-      if (!nodes.fxFeedback) {
-        nodes.fxFeedback = ctx.createGain();
-        nodes.fxFeedback.gain.value = 0.17;
-      }
-      if (!nodes.fxTone) {
-        nodes.fxTone = ctx.createBiquadFilter();
-        nodes.fxTone.type = 'lowpass';
-        nodes.fxTone.frequency.value = 4470;
-      }
-      nodes.compressor.connect(nodes.fxDelay);
-      nodes.fxDelay.connect(nodes.fxTone);
-      nodes.fxTone.connect(nodes.fxFeedback);
-      nodes.fxFeedback.connect(nodes.fxDelay);
-      nodes.fxTone.connect(nodes.delayWetGain);
-      nodes.delayWetGain.connect(nodes.panner);
+
+      nodes.postWiderGain.connect(nodes.delayInPan);
+      nodes.delayWetGain!.connect(nodes.panner);
       nodes.delayBranchWired = true;
     } else {
       try {
-        nodes.compressor.disconnect(nodes.fxDelay!);
+        nodes.postWiderGain.disconnect(nodes.delayInPan!);
         nodes.delayWetGain?.disconnect(nodes.panner);
       } catch {
         // ignore
@@ -590,74 +1003,38 @@ export class StudioAudioEngine {
     }
   }
 
-  private ensureChannelHarmonyBranch(ctx: AudioContext, nodes: ChannelNodes, shouldWire: boolean): void {
-    if (shouldWire === Boolean(nodes.harmonyBranchWired)) return;
-    if (shouldWire) {
-      if (!nodes.harmonyWetGain) {
-        nodes.harmonyWetGain = ctx.createGain();
-        nodes.harmonyWetGain.gain.value = 0;
-      }
-      if (nodes.harmonyVoiceGains.length === 0) {
-        const voiceTimes = [0.009, 0.015, 0.021, 0.027];
-        const voicePans = [-0.35, 0.35, -0.65, 0.65];
-        const voiceLfoHz = [1.1, 1.5, 0.85, 1.85];
-        voiceTimes.forEach((dt, idx) => {
-          const vDelay = ctx.createDelay(0.1);
-          vDelay.delayTime.value = dt;
-          const lfo = ctx.createOscillator();
-          lfo.frequency.value = voiceLfoHz[idx];
-          const lfoDepth = ctx.createGain();
-          lfoDepth.gain.value = 0.0014;
-          lfo.connect(lfoDepth);
-          lfoDepth.connect(vDelay.delayTime);
-          lfo.start();
-
-          const vPan = ctx.createStereoPanner();
-          vPan.pan.value = voicePans[idx];
-          const vGain = ctx.createGain();
-          vGain.gain.value = 0;
-
-          nodes.compressor.connect(vDelay);
-          vDelay.connect(vGain);
-          vGain.connect(vPan);
-          vPan.connect(nodes.harmonyWetGain!);
-          nodes.harmonyVoiceGains.push(vGain);
-          nodes.harmonyLfoOscs.push(lfo);
-        });
-      }
-      nodes.harmonyWetGain.connect(nodes.panner);
-      nodes.harmonyBranchWired = true;
-    } else {
-      try {
-        nodes.harmonyWetGain?.disconnect(nodes.panner);
-      } catch {
-        // ignore
-      }
-      nodes.harmonyBranchWired = false;
-    }
-  }
-
   public rebuildGraph(channels: ChannelState[]): void {
     this.channelsSnapshot = channels;
     if (!this.ctx) return;
     const ctx = this.ctx;
 
+    const makeEqFilter = (type: BiquadFilterType, freq: number, q = 0.7071): BiquadFilterNode => {
+      const f = ctx.createBiquadFilter();
+      f.type = type;
+      f.frequency.value = freq;
+      f.Q.value = q;
+      f.gain.value = 0;
+      return f;
+    };
+
     // Create nodes for any channel not yet created
     for (const ch of channels) {
       if (!this.channelNodes.has(ch.id)) {
         const inputGain = ctx.createGain();
-        const lowFilter = ctx.createBiquadFilter();
-        lowFilter.type = 'lowshelf';
-        lowFilter.frequency.value = 120;
-
-        const midFilter = ctx.createBiquadFilter();
-        midFilter.type = 'peaking';
-        midFilter.frequency.value = 1200;
-        midFilter.Q.value = 1.0;
-
-        const highFilter = ctx.createBiquadFilter();
-        highFilter.type = 'highshelf';
-        highFilter.frequency.value = 6000;
+        const eqLowCut1 = makeEqFilter('peaking', 60, 0.7071);
+        const eqLowCut2 = makeEqFilter('peaking', 60, 0.7071);
+        const eqLlcFilter = makeEqFilter('peaking', 50, 0.7071);
+        const eqLfFilter = makeEqFilter('lowshelf', 65, 0.8);
+        const eqLmfFilter = makeEqFilter('peaking', 240, 1.8);
+        const eqMfFilter = makeEqFilter('peaking', 1000, 1.4);
+        const eqHmfFilter = makeEqFilter('peaking', 4200, 2.2);
+        const eqHfFilter = makeEqFilter('highshelf', 8500, 0.7);
+        const eqHighCut1 = makeEqFilter('peaking', 18000, 0.7071);
+        const eqHighCut2 = makeEqFilter('peaking', 18000, 0.7071);
+        const eqSoloFilter = makeEqFilter('peaking', 1000, 1.4);
+        const eqOutGain = ctx.createGain();
+        const postGateGain = ctx.createGain();
+        const postSatGain = ctx.createGain();
 
         const megaphoneFilter = ctx.createBiquadFilter();
         megaphoneFilter.type = 'peaking';
@@ -665,7 +1042,22 @@ export class StudioAudioEngine {
         megaphoneFilter.Q.value = 1.0;
         megaphoneFilter.gain.value = 0;
 
+        // Parallel Compressor Matrix (bypassed cleanly when compDryGain=1, compWetGain=0)
+        const compDryGain = ctx.createGain();
+        compDryGain.gain.value = 1;
+        const compDriveGain = ctx.createGain();
+        compDriveGain.gain.value = 1;
         const compressor = ctx.createDynamicsCompressor();
+        const compMakeupGain = ctx.createGain();
+        compMakeupGain.gain.value = 1;
+        const compWetGain = ctx.createGain();
+        compWetGain.gain.value = 0;
+        const compSumGain = ctx.createGain();
+        compSumGain.gain.value = 1;
+
+        const postMbGain = ctx.createGain();
+        const postDuckGain = ctx.createGain();
+        const postWiderGain = ctx.createGain();
         const revDryGain = ctx.createGain();
         revDryGain.gain.value = 1;
 
@@ -673,23 +1065,44 @@ export class StudioAudioEngine {
         const faderGain = ctx.createGain();
         const splitter = ctx.createChannelSplitter(2);
         const analyserL = ctx.createAnalyser();
-        analyserL.fftSize = ch.type === 'master' ? 2048 : 512;
-        analyserL.smoothingTimeConstant = 0.72;
+        analyserL.fftSize = 8192;
+        analyserL.minDecibels = -100;
+        analyserL.maxDecibels = 12;
+        analyserL.smoothingTimeConstant = 0.52;
         const analyserR = ctx.createAnalyser();
-        analyserR.fftSize = ch.type === 'master' ? 2048 : 512;
-        analyserR.smoothingTimeConstant = 0.72;
+        analyserR.fftSize = 8192;
+        analyserR.minDecibels = -100;
+        analyserR.maxDecibels = 12;
+        analyserR.smoothingTimeConstant = 0.52;
         const outputRouterGain = ctx.createGain();
 
         const nodes: ChannelNodes = {
           inputGain,
-          lowFilter,
-          midFilter,
-          highFilter,
+          eqLowCut1,
+          eqLowCut2,
+          eqLlcFilter,
+          eqLfFilter,
+          eqLmfFilter,
+          eqMfFilter,
+          eqHmfFilter,
+          eqHfFilter,
+          eqHighCut1,
+          eqHighCut2,
+          eqSoloFilter,
+          eqOutGain,
+          postGateGain,
+          postSatGain,
           megaphoneFilter,
+          compDryGain,
+          compDriveGain,
           compressor,
+          compMakeupGain,
+          compWetGain,
+          compSumGain,
+          postMbGain,
+          postDuckGain,
+          postWiderGain,
           revDryGain,
-          harmonyVoiceGains: [],
-          harmonyLfoOscs: [],
           panner,
           faderGain,
           splitter,
@@ -699,51 +1112,40 @@ export class StudioAudioEngine {
           sendGains: new Map(),
         };
 
-        // FX Bus DSP
-        if (ch.type === 'fx') {
-          const isReverb = ch.inserts.some((i) => i.type === 'reverb');
-          const isDelay = ch.inserts.some((i) => i.type === 'delay' || i.type === 'harmony');
+        // Wire full 7-band EQ chain
+        inputGain.connect(eqLowCut1);
+        eqLowCut1.connect(eqLowCut2);
+        eqLowCut2.connect(eqLlcFilter);
+        eqLlcFilter.connect(eqLfFilter);
+        eqLfFilter.connect(eqLmfFilter);
+        eqLmfFilter.connect(eqMfFilter);
+        eqMfFilter.connect(eqHmfFilter);
+        eqHmfFilter.connect(eqHfFilter);
+        eqHfFilter.connect(eqHighCut1);
+        eqHighCut1.connect(eqHighCut2);
+        eqHighCut2.connect(eqSoloFilter);
+        eqSoloFilter.connect(eqOutGain);
 
-          if (isReverb) {
-            const revPlugin = ch.inserts.find((i) => i.type === 'reverb');
-            const decay = revPlugin?.params.decay ?? 2.5;
-            const fxConvolver = ctx.createConvolver();
-            fxConvolver.buffer = createImpulseResponse(ctx, Math.min(5, decay), 2.4, 3600);
-            nodes.fxConvolver = fxConvolver;
-            inputGain.connect(fxConvolver);
-            fxConvolver.connect(lowFilter);
-          } else if (isDelay) {
-            const delPlugin = ch.inserts.find((i) => i.type === 'delay');
-            const chDelay = ctx.createDelay(2.0);
-            chDelay.delayTime.value = (delPlugin?.params.timeMs ?? 320) / 1000;
-            const chDelayFeedback = ctx.createGain();
-            chDelayFeedback.gain.value = Math.min(0.85, (delPlugin?.params.feedback ?? 35) / 100);
-            const chDelayTone = ctx.createBiquadFilter();
-            chDelayTone.type = 'lowpass';
-            chDelayTone.frequency.value = delPlugin?.params.tone ?? 3200;
-            nodes.fxDelay = chDelay;
-            nodes.fxFeedback = chDelayFeedback;
-            nodes.fxTone = chDelayTone;
+        // Gate -> Saturation -> Megaphone anchors
+        eqOutGain.connect(postGateGain);
+        postGateGain.connect(postSatGain);
+        postSatGain.connect(megaphoneFilter);
 
-            inputGain.connect(chDelay);
-            chDelay.connect(chDelayTone);
-            chDelayTone.connect(chDelayFeedback);
-            chDelayFeedback.connect(chDelay);
-            chDelayTone.connect(lowFilter);
-          } else {
-            inputGain.connect(lowFilter);
-          }
-        } else {
-          inputGain.connect(lowFilter);
-        }
+        // Parallel Compressor Matrix
+        megaphoneFilter.connect(compDryGain);
+        compDryGain.connect(compSumGain);
 
-        lowFilter.connect(midFilter);
-        midFilter.connect(highFilter);
-        highFilter.connect(megaphoneFilter);
-        megaphoneFilter.connect(compressor);
+        megaphoneFilter.connect(compDriveGain);
+        compDriveGain.connect(compressor);
+        compressor.connect(compMakeupGain);
+        compMakeupGain.connect(compWetGain);
+        compWetGain.connect(compSumGain);
 
-        // Main dry path
-        compressor.connect(revDryGain);
+        // Multiband -> Ducking -> Wider -> Harmony -> Reverb/Delay Dry anchors
+        compSumGain.connect(postMbGain);
+        postMbGain.connect(postDuckGain);
+        postDuckGain.connect(postWiderGain);
+        postWiderGain.connect(revDryGain);
         revDryGain.connect(panner);
 
         panner.connect(faderGain);
@@ -756,6 +1158,9 @@ export class StudioAudioEngine {
         // Master metering FFT & hardware destination gate
         if (ch.type === 'master') {
           this.fftBuf = new Uint8Array(analyserL.frequencyBinCount);
+          this.floatFftBufL = new Float32Array(analyserL.frequencyBinCount);
+          this.floatFftBufR = new Float32Array(analyserR.frequencyBinCount);
+          this.floatFftBufOut = new Float32Array(analyserL.frequencyBinCount);
           this.recordDest = ctx.createMediaStreamDestination();
           this.masterOutputGain = ctx.createGain();
           const masterEnabled = this.masterOutputEnabled && ch.outputTargetType !== 'none';
@@ -767,16 +1172,33 @@ export class StudioAudioEngine {
 
         this.channelNodes.set(ch.id, nodes);
       }
+    }
 
-      // Lazily attach/detach heavy parallel FX branches only when enabled on non-fx strips
+    for (const ch of channels) {
       const nodes = this.channelNodes.get(ch.id);
-      if (nodes && ch.type !== 'fx') {
+      if (nodes) {
+        if (ch.inserts.some((i) => i.type === 'gate')) {
+          this.ensureChannelGateNode(ctx, ch.id, nodes);
+        }
+        if (ch.inserts.some((i) => i.type === 'saturation')) {
+          this.ensureChannelSaturationNode(ctx, ch.id, nodes);
+        }
+        if (ch.inserts.some((i) => i.type === 'multiband')) {
+          this.ensureChannelMultibandNode(ctx, nodes);
+        }
+        if (ch.inserts.some((i) => i.type === 'ducking')) {
+          this.ensureChannelDuckingNode(ctx, ch.id, nodes);
+        }
+        if (ch.inserts.some((i) => i.type === 'wider')) {
+          this.ensureChannelWiderMatrix(ctx, nodes);
+        }
+        if (ch.inserts.some((i) => i.type === 'harmony')) {
+          this.ensureChannelHarmonyNode(ctx, nodes);
+        }
         const needsReverb = ch.inserts.some((i) => i.type === 'reverb' && i.enabled);
         const needsDelay = ch.inserts.some((i) => i.type === 'delay' && i.enabled);
-        const needsHarmony = ch.inserts.some((i) => i.type === 'harmony' && i.enabled);
         this.ensureChannelReverbBranch(ctx, nodes, needsReverb);
         this.ensureChannelDelayBranch(ctx, nodes, needsDelay);
-        this.ensureChannelHarmonyBranch(ctx, nodes, needsHarmony);
       }
     }
 
@@ -799,31 +1221,43 @@ export class StudioAudioEngine {
       for (const fxDef of internalFxDefs) {
         if (referencedBusIds.has(fxDef.id) && !this.channelNodes.has(fxDef.id)) {
           const inputGain = ctx.createGain();
-          const lowFilter = ctx.createBiquadFilter();
-          lowFilter.type = 'highpass';
-          lowFilter.frequency.value = 160;
-          const midFilter = ctx.createBiquadFilter();
-          const highFilter = ctx.createBiquadFilter();
+          const eqLowCut1 = makeEqFilter('highpass', 160, 0.7071);
+          const eqLowCut2 = makeEqFilter('peaking', 160, 0.7071);
+          const eqLlcFilter = makeEqFilter('peaking', 50, 0.7071);
+          const eqLfFilter = makeEqFilter('lowshelf', 120, 0.7);
+          const eqLmfFilter = makeEqFilter('peaking', 240, 1.4);
+          const eqMfFilter = makeEqFilter('peaking', 1000, 1.0);
+          const eqHmfFilter = makeEqFilter('peaking', 4200, 1.4);
+          const eqHfFilter = makeEqFilter('highshelf', 8000, 0.7);
+          const eqHighCut1 = makeEqFilter('peaking', 18000, 0.7071);
+          const eqHighCut2 = makeEqFilter('peaking', 18000, 0.7071);
+          const eqSoloFilter = makeEqFilter('peaking', 1000, 1.4);
+          const eqOutGain = ctx.createGain();
           const megaphoneFilter = ctx.createBiquadFilter();
           megaphoneFilter.type = 'peaking';
           megaphoneFilter.gain.value = 0;
+          const compDryGain = ctx.createGain();
+          const compDriveGain = ctx.createGain();
           const compressor = ctx.createDynamicsCompressor();
+          const compMakeupGain = ctx.createGain();
+          const compWetGain = ctx.createGain();
+          const compSumGain = ctx.createGain();
           const revDryGain = ctx.createGain();
           const panner = ctx.createStereoPanner();
           const faderGain = ctx.createGain();
           faderGain.gain.value = 0.7;
           const splitter = ctx.createChannelSplitter(2);
           const analyserL = ctx.createAnalyser();
-          analyserL.fftSize = 512;
+          analyserL.fftSize = 2048;
           const analyserR = ctx.createAnalyser();
-          analyserR.fftSize = 512;
+          analyserR.fftSize = 2048;
           const outputRouterGain = ctx.createGain();
 
           if (fxDef.mode === 'reverb') {
             const conv = ctx.createConvolver();
             conv.buffer = createImpulseResponse(ctx, fxDef.decay, 2.4, 3400);
             inputGain.connect(conv);
-            conv.connect(lowFilter);
+            conv.connect(eqLowCut1);
           } else {
             const delay = ctx.createDelay(2.0);
             delay.delayTime.value = fxDef.timeMs / 1000;
@@ -832,21 +1266,44 @@ export class StudioAudioEngine {
             inputGain.connect(delay);
             delay.connect(fb);
             fb.connect(delay);
-            delay.connect(lowFilter);
+            delay.connect(eqLowCut1);
           }
-          lowFilter.connect(faderGain);
+          eqLowCut1.connect(faderGain);
           faderGain.connect(masterNode.inputGain);
+
+          const postGateGain = ctx.createGain();
+          const postSatGain = ctx.createGain();
+          const postMbGain = ctx.createGain();
+          const postDuckGain = ctx.createGain();
+          const postWiderGain = ctx.createGain();
 
           this.channelNodes.set(fxDef.id, {
             inputGain,
-            lowFilter,
-            midFilter,
-            highFilter,
+            eqLowCut1,
+            eqLowCut2,
+            eqLlcFilter,
+            eqLfFilter,
+            eqLmfFilter,
+            eqMfFilter,
+            eqHmfFilter,
+            eqHfFilter,
+            eqHighCut1,
+            eqHighCut2,
+            eqSoloFilter,
+            eqOutGain,
+            postGateGain,
+            postSatGain,
             megaphoneFilter,
+            compDryGain,
+            compDriveGain,
             compressor,
+            compMakeupGain,
+            compWetGain,
+            compSumGain,
+            postMbGain,
+            postDuckGain,
+            postWiderGain,
             revDryGain,
-            harmonyVoiceGains: [],
-            harmonyLfoOscs: [],
             panner,
             faderGain,
             splitter,
@@ -945,21 +1402,35 @@ export class StudioAudioEngine {
     const ctx = this.ctx;
     const now = ctx.currentTime;
     const anySolo = channels.some((c) => c.solo && c.type !== 'master' && c.type !== 'listen');
+    const nyquist = ctx.sampleRate * 0.48;
+    const bpm = this.transportSnapshot?.bpm ?? 120;
+
+    const setBypassableFilter = (
+      node: BiquadFilterNode,
+      active: boolean,
+      type: BiquadFilterType,
+      freq: number,
+      q: number,
+      gainDb = 0
+    ) => {
+      const targetType: BiquadFilterType = active ? type : 'peaking';
+      if (node.type !== targetType) {
+        node.type = targetType;
+      }
+      node.frequency.setTargetAtTime(Math.max(20, Math.min(nyquist, freq)), now, 0.015);
+      node.Q.setTargetAtTime(Math.max(0.25, Math.min(18, q)), now, 0.015);
+      node.gain.setTargetAtTime(active ? gainDb : 0, now, 0.015);
+    };
 
     for (const ch of channels) {
       const nodes = this.channelNodes.get(ch.id);
       if (!nodes) continue;
 
-      // Polarity & Input Gain (+ Wider / Limiter / Compressor makeup gain)
+      // Polarity & Input Gain (+ Limiter gain) — Wider gain & Compressor makeup handled in their own stages
       const polaritySign = !ch.polarityLeft && ch.polarityRight ? -1 : 1;
-      const widerIns = ch.inserts.find((i) => i.type === 'wider' && i.enabled);
       const limiterIns = ch.inserts.find((i) => i.type === 'limiter' && i.enabled);
-      const compIns = ch.inserts.find((i) => i.type === 'compressor' && i.enabled);
-      const extraGainDb =
-        (widerIns?.params.gain ?? 0) +
-        (limiterIns?.params.gain ?? 0) +
-        (compIns?.params.makeup ?? 0);
-      nodes.inputGain.gain.setTargetAtTime(dbToLinear(ch.inputGainDb + extraGainDb) * polaritySign, now, 0.015);
+      const extraGainDb = limiterIns?.params.gain ?? 0;
+      nodes.inputGain.gain.setTargetAtTime(dbToLinear(ch.inputGainDb + extraGainDb) * polaritySign, now, 0.012);
 
       // Live mic mono/stereo input routing matrix
       if (nodes.micGainLL && nodes.micGainLR && nodes.micGainRL && nodes.micGainRR) {
@@ -990,20 +1461,170 @@ export class StudioAudioEngine {
         nodes.micGainRR.gain.setTargetAtTime(rr, now, 0.008);
       }
 
-      // EQ inserts
+      // Full 7-Band Parametric EQ + LC / LLC / HC / Out Gain / Band Solo
       const eqInsert = ch.inserts.find((i) => (i.type === 'pro-q' || i.type === 'pro-eq') && i.enabled);
       if (eqInsert) {
-        nodes.lowFilter.gain.setTargetAtTime(eqInsert.params.lowGain ?? 0, now, 0.02);
-        nodes.midFilter.frequency.setTargetAtTime(eqInsert.params.midFreq ?? 1200, now, 0.02);
-        nodes.midFilter.gain.setTargetAtTime(eqInsert.params.midGain ?? 0, now, 0.02);
-        nodes.highFilter.gain.setTargetAtTime(eqInsert.params.highGain ?? 0, now, 0.02);
+        const p = eqInsert.params;
+        const lcOn = (p.lc_on ?? 1) === 1;
+        const lcFreq = p.lc_freq ?? p.lowCut ?? 60;
+        const lcSlope = p.lc_slope ?? 12;
+        setBypassableFilter(
+          nodes.eqLowCut1,
+          lcOn,
+          'highpass',
+          lcFreq,
+          lcSlope === 6 ? 0.5 : lcSlope >= 48 ? 1.306 : 0.7071
+        );
+        setBypassableFilter(
+          nodes.eqLowCut2,
+          lcOn && lcSlope >= 24,
+          'highpass',
+          lcFreq,
+          lcSlope >= 48 ? 0.541 : 0.7071
+        );
+
+        const llcOn = (p.llc_on ?? 0) === 1;
+        const llcHz = p.llc_hz ?? 50;
+        const llcSoft = (p.llc_soft ?? 0) === 1;
+        setBypassableFilter(nodes.eqLlcFilter, llcOn, 'highpass', llcHz, llcSoft ? 0.5 : 0.7071);
+
+        const lfOn = (p.lf_on ?? 1) === 1;
+        const lfShape = Math.round(p.lf_shape ?? 1);
+        const lfGain = p.lf_gain ?? p.lowGain ?? 0;
+        setBypassableFilter(
+          nodes.eqLfFilter,
+          lfOn,
+          lfShape === 0 ? 'peaking' : 'lowshelf',
+          p.lf_freq ?? 65,
+          lfShape === 0 ? (p.lf_q ?? 1.4) : lfShape === 2 ? 0.95 : 0.6,
+          lfGain
+        );
+
+        const lmfOn = (p.lmf_on ?? 1) === 1;
+        const lmfGain = p.lmf_gain ?? 0;
+        setBypassableFilter(nodes.eqLmfFilter, lmfOn, 'peaking', p.lmf_freq ?? 240, p.lmf_q ?? 1.8, lmfGain);
+
+        const mfOn = (p.mf_on ?? 1) === 1;
+        const mfGain = p.mf_gain ?? p.midGain ?? 0;
+        setBypassableFilter(
+          nodes.eqMfFilter,
+          mfOn,
+          'peaking',
+          p.mf_freq ?? p.midFreq ?? 1000,
+          p.mf_q ?? 1.4,
+          mfGain
+        );
+
+        const hmfOn = (p.hmf_on ?? 1) === 1;
+        const hmfGain = p.hmf_gain ?? 0;
+        setBypassableFilter(nodes.eqHmfFilter, hmfOn, 'peaking', p.hmf_freq ?? 4200, p.hmf_q ?? 2.2, hmfGain);
+
+        const hfOn = (p.hf_on ?? 1) === 1;
+        const hfShape = Math.round(p.hf_shape ?? 1);
+        const hfGain = p.hf_gain ?? p.highGain ?? 0;
+        setBypassableFilter(
+          nodes.eqHfFilter,
+          hfOn,
+          hfShape === 0 ? 'peaking' : 'highshelf',
+          p.hf_freq ?? 8500,
+          hfShape === 0 ? (p.hf_q ?? 1.0) : hfShape === 2 ? 0.95 : 0.6,
+          hfGain
+        );
+
+        const hcOn = (p.hc_on ?? 1) === 1;
+        const hcFreq = p.hc_freq ?? 18000;
+        const hcSlope = p.hc_slope ?? 12;
+        setBypassableFilter(
+          nodes.eqHighCut1,
+          hcOn,
+          'lowpass',
+          hcFreq,
+          hcSlope === 6 ? 0.5 : hcSlope >= 48 ? 1.306 : 0.7071
+        );
+        setBypassableFilter(
+          nodes.eqHighCut2,
+          hcOn && hcSlope >= 24,
+          'lowpass',
+          hcFreq,
+          hcSlope >= 48 ? 0.541 : 0.7071
+        );
+
+        // Solo Band audition
+        const soloBand = (['lf', 'lmf', 'mf', 'hmf', 'hf'] as const).find((b) => (p[`${b}_solo`] ?? 0) === 1);
+        if (soloBand) {
+          const sFreq = p[`${soloBand}_freq`] ?? (soloBand === 'lf' ? 65 : soloBand === 'lmf' ? 240 : soloBand === 'mf' ? 1000 : soloBand === 'hmf' ? 4200 : 8500);
+          const sQ = Math.max(1.0, p[`${soloBand}_q`] ?? 1.6);
+          setBypassableFilter(nodes.eqSoloFilter, true, 'bandpass', sFreq, sQ, 0);
+        } else {
+          setBypassableFilter(nodes.eqSoloFilter, false, 'peaking', 1000, 1.4, 0);
+        }
+
+        const autoGainComp = (p.auto_gain ?? 0) === 1 ? -((lfGain + lmfGain + mfGain + hmfGain + hfGain) * 0.25) : 0;
+        nodes.eqOutGain.gain.setTargetAtTime(dbToLinear((p.out_gain ?? 0) + autoGainComp), now, 0.015);
       } else {
-        nodes.lowFilter.gain.setTargetAtTime(0, now, 0.02);
-        nodes.midFilter.gain.setTargetAtTime(0, now, 0.02);
-        nodes.highFilter.gain.setTargetAtTime(0, now, 0.02);
+        setBypassableFilter(nodes.eqLowCut1, false, 'peaking', 60, 0.7071, 0);
+        setBypassableFilter(nodes.eqLowCut2, false, 'peaking', 60, 0.7071, 0);
+        setBypassableFilter(nodes.eqLlcFilter, false, 'peaking', 50, 0.7071, 0);
+        setBypassableFilter(nodes.eqLfFilter, false, 'peaking', 65, 0.7071, 0);
+        setBypassableFilter(nodes.eqLmfFilter, false, 'peaking', 240, 1.4, 0);
+        setBypassableFilter(nodes.eqMfFilter, false, 'peaking', 1000, 1.4, 0);
+        setBypassableFilter(nodes.eqHmfFilter, false, 'peaking', 4200, 1.4, 0);
+        setBypassableFilter(nodes.eqHfFilter, false, 'peaking', 8500, 0.7071, 0);
+        setBypassableFilter(nodes.eqHighCut1, false, 'peaking', 18000, 0.7071, 0);
+        setBypassableFilter(nodes.eqHighCut2, false, 'peaking', 18000, 0.7071, 0);
+        setBypassableFilter(nodes.eqSoloFilter, false, 'peaking', 1000, 1.4, 0);
+        nodes.eqOutGain.gain.setTargetAtTime(1, now, 0.015);
       }
 
-      // Megaphone bandpass insert (unity peaking 0dB when bypassed to avoid phase shift / filter reset clicks)
+      // Gate AudioWorklet
+      const gateIns = ch.inserts.find((i) => i.type === 'gate');
+      if (nodes.gateNode) {
+        if (gateIns && gateIns.enabled) {
+          const gp = gateIns.params;
+          nodes.gateNode.port.postMessage({
+            enabled: true,
+            thresholdDb: gp.threshold ?? -54.48,
+            rangeDb: gp.range ?? -18,
+            attackMs: gp.attack ?? 12,
+            holdMs: gp.hold ?? 50,
+            releaseMs: gp.release ?? 250,
+            lookAhead: (gp.lookAhead ?? 1) === 1,
+            ducking: (gp.ducking ?? 0) === 1,
+            scFilter: (gp.scFilter ?? 0) === 1,
+            lowCutHz: gp.lowCut ?? 80,
+            highCutHz: gp.highCut ?? 10000,
+            scSwap: (gp.scSwap ?? 0) === 1,
+            scListen: (gp.scListen ?? 0) === 1,
+          });
+        } else {
+          nodes.gateNode.port.postMessage({ enabled: false });
+          this.gateAttenMap.set(ch.id, 0);
+        }
+      }
+
+      // Saturation AudioWorklet (2x Oversampled Tube / Tape / Crunch / Diode)
+      const satIns = ch.inserts.find((i) => i.type === 'saturation');
+      if (nodes.saturationNode) {
+        if (satIns && satIns.enabled) {
+          const sp = satIns.params;
+          nodes.saturationNode.port.postMessage({
+            enabled: true,
+            mode: Math.round(sp.mode ?? 0),
+            drive: sp.drive ?? 32,
+            harmonics: sp.harmonics ?? 38,
+            lowCutHz: sp.lowCut ?? 85,
+            toneHz: sp.tone ?? 7200,
+            outputDb: sp.outputDb ?? 0,
+            autoGain: (sp.autoGain ?? 1) === 1,
+            mix: Math.max(0, Math.min(1, (sp.mix ?? 75) / 100)),
+          });
+        } else {
+          nodes.saturationNode.port.postMessage({ enabled: false });
+          this.satMetricsMap.delete(ch.id);
+        }
+      }
+
+      // Megaphone bandpass insert (unity peaking 0dB when bypassed)
       const mega = ch.inserts.find((i) => i.type === 'megaphone' && i.enabled);
       if (mega) {
         if (nodes.megaphoneFilter.type !== 'bandpass') {
@@ -1019,93 +1640,352 @@ export class StudioAudioEngine {
         nodes.megaphoneFilter.Q.setTargetAtTime(1.0, now, 0.02);
       }
 
-      // Compressor / Limiter / Multiband
+      // Compressor / Limiter (True Parallel Matrix + POST-compressor Makeup)
       const comp = ch.inserts.find(
-        (i) => (i.type === 'compressor' || i.type === 'limiter' || i.type === 'multiband') && i.enabled
+        (i) =>
+          (i.type === 'compressor' || i.type === 'limiter' || (i.type === 'multiband' && !nodes.multibandWired)) &&
+          i.enabled
       );
       if (comp) {
+        const cp = comp.params;
         const thresh =
           comp.type === 'limiter'
-            ? Math.min(comp.params.threshold ?? -3, comp.params.ceiling ?? -0.3)
-            : comp.params.threshold ?? -18;
-        nodes.compressor.threshold.setTargetAtTime(Math.max(-60, Math.min(0, thresh)), now, 0.02);
-        nodes.compressor.ratio.setTargetAtTime(comp.type === 'limiter' ? 20 : comp.params.ratio ?? 4, now, 0.02);
+            ? Math.min(cp.threshold ?? -3, cp.ceiling ?? -0.3)
+            : cp.threshold ?? -24;
+        const ratioVal = comp.type === 'limiter' ? 20 : Math.max(1, Math.min(20, cp.ratio ?? 4.2));
+        const autoEnv = (cp.autoEnv ?? 0) === 1;
+        const adaptive = (cp.adaptive ?? 0) === 1;
+
+        nodes.compressor.threshold.setTargetAtTime(Math.max(-60, Math.min(0, thresh)), now, 0.015);
+        nodes.compressor.ratio.setTargetAtTime(ratioVal, now, 0.015);
         nodes.compressor.knee.setTargetAtTime(
-          comp.type === 'limiter' ? 0 : Math.max(0, Math.min(40, (comp.params.knee ?? 3.8) * 3)),
+          comp.type === 'limiter' ? 0 : Math.max(0, Math.min(40, (cp.knee ?? 3.88) * 3 + (adaptive ? 6 : 0))),
           now,
-          0.02
+          0.015
         );
-        const attackMs =
+        const rawAttackMs =
           comp.type === 'limiter'
-            ? comp.params.attackMode === 0
+            ? cp.attackMode === 0
               ? 1
-              : comp.params.attackMode === 2
+              : cp.attackMode === 2
               ? 12
               : 4
-            : comp.params.attack ?? 12;
-        nodes.compressor.attack.setTargetAtTime(Math.max(0.0002, attackMs / 1000), now, 0.02);
-        nodes.compressor.release.setTargetAtTime(Math.max(0.01, (comp.params.release ?? 120) / 1000), now, 0.02);
+            : autoEnv
+            ? 8
+            : cp.attack ?? 4;
+        const rawReleaseMs = autoEnv ? 180 : (cp.release ?? 80) * (adaptive ? 1.45 : 1.0);
+        nodes.compressor.attack.setTargetAtTime(Math.max(0.0002, rawAttackMs / 1000), now, 0.015);
+        nodes.compressor.release.setTargetAtTime(Math.max(0.008, Math.min(1.0, rawReleaseMs / 1000)), now, 0.015);
+
+        // Input drive (Side Gain) + POST-compressor Makeup + Mix
+        const driveDb = comp.type === 'compressor' ? (cp.sideGain ?? 0) : 0;
+        const autoMakeupDb =
+          (cp.autoMakeup ?? 0) === 1
+            ? Math.max(0, Math.min(16, (-thresh * (1 - 1 / ratioVal)) * 0.32))
+            : 0;
+        const makeupDb = (comp.type === 'compressor' ? (cp.makeup ?? 0) : 0) + autoMakeupDb - driveDb * 0.4;
+        const compMixNorm = Math.max(0, Math.min(1, (cp.mix ?? 100) / 100));
+
+        this.compMixMap.set(ch.id, compMixNorm);
+        nodes.compDriveGain.gain.setTargetAtTime(dbToLinear(driveDb), now, 0.012);
+        nodes.compMakeupGain.gain.setTargetAtTime(dbToLinear(makeupDb), now, 0.012);
+        nodes.compWetGain.gain.setTargetAtTime(compMixNorm, now, 0.01);
+        nodes.compDryGain.gain.setTargetAtTime(1 - compMixNorm, now, 0.01);
       } else {
-        nodes.compressor.threshold.setTargetAtTime(0, now, 0.02);
-        nodes.compressor.ratio.setTargetAtTime(1, now, 0.02);
+        this.compMixMap.set(ch.id, 0);
+        nodes.compressor.threshold.setTargetAtTime(0, now, 0.015);
+        nodes.compressor.ratio.setTargetAtTime(1, now, 0.015);
+        nodes.compDriveGain.gain.setTargetAtTime(1, now, 0.012);
+        nodes.compMakeupGain.gain.setTargetAtTime(1, now, 0.012);
+        nodes.compWetGain.gain.setTargetAtTime(0, now, 0.01);
+        nodes.compDryGain.gain.setTargetAtTime(1, now, 0.01);
       }
 
-      // Delay FX / Insert params
-      if (nodes.fxDelay && nodes.fxFeedback && nodes.fxTone && nodes.delayWetGain) {
-        const del = ch.inserts.find((i) => i.type === 'delay');
-        if (del && del.enabled) {
-          nodes.fxDelay.delayTime.setTargetAtTime(
-            Math.max(0.01, Math.min(1.9, (del.params.timeMs ?? 500) / 1000)),
-            now,
-            0.01
-          );
-          nodes.fxFeedback.gain.setTargetAtTime(
-            Math.min(0.85, (del.params.feedback ?? 17) / 100),
-            now,
-            0.01
-          );
-          nodes.fxTone.frequency.setTargetAtTime(del.params.hiCut ?? del.params.tone ?? 4470, now, 0.01);
-          nodes.delayWetGain.gain.setTargetAtTime(
-            Math.max(0, Math.min(1, (del.params.mix ?? 100) / 100)) * 0.75,
-            now,
-            0.008
-          );
-        } else {
-          nodes.fxFeedback.gain.setTargetAtTime(0, now, 0.01);
-          nodes.delayWetGain.gain.setTargetAtTime(0, now, 0.008);
-        }
-      }
-
-      // Reverb Insert wet/dry & pre-delay
-      const revIns = ch.inserts.find((i) => i.type === 'reverb' && i.enabled);
-      if (revIns && ch.type !== 'fx' && nodes.revPreDelay && nodes.revWetGain) {
-        const mixNorm = Math.max(0, Math.min(1, (revIns.params.mix ?? 100) / 100));
-        const preDelaySec = Math.max(0, Math.min(0.45, (revIns.params.preDelay ?? 70) / 1000));
-        nodes.revPreDelay.delayTime.setTargetAtTime(preDelaySec, now, 0.006);
-        nodes.revDryGain.gain.setTargetAtTime(1 - mixNorm * 0.65, now, 0.006);
-        nodes.revWetGain.gain.setTargetAtTime(mixNorm * 0.9, now, 0.006);
-      } else {
-        nodes.revDryGain.gain.setTargetAtTime(1, now, 0.006);
-        if (nodes.revWetGain) {
-          nodes.revWetGain.gain.setTargetAtTime(0, now, 0.006);
-        }
-      }
-
-      // Harmony 1/2/3/4 Voice Insert DSP
-      const harmIns = ch.inserts.find((i) => i.type === 'harmony' && i.enabled);
-      if (nodes.harmonyWetGain) {
-        if (harmIns && nodes.harmonyVoiceGains.length === 4) {
-          const vCount = Math.max(1, Math.min(4, Math.round(harmIns.params.voiceCount ?? 2)));
-          const hMix = Math.max(0, Math.min(1, (harmIns.params.mix ?? 75) / 100));
-          nodes.harmonyWetGain.gain.setTargetAtTime(hMix * 0.75, now, 0.008);
-          nodes.harmonyVoiceGains.forEach((vg, idx) => {
-            const lvlDb = harmIns.params[`v${idx}_level`] ?? -3;
-            vg.gain.setTargetAtTime(idx < vCount ? dbToLinear(lvlDb) * 0.55 : 0, now, 0.008);
+      // 5-Band Multiband Compressor AudioWorklet
+      const mbIns = ch.inserts.find((i) => i.type === 'multiband');
+      if (nodes.multibandNode) {
+        if (mbIns && mbIns.enabled) {
+          const mp = mbIns.params;
+          const autoSp = (mp.autoSpeed ?? 1) === 1;
+          nodes.multibandNode.port.postMessage({
+            enabled: true,
+            xovers: [mp.x1 ?? 65.1, mp.x2 ?? 241.9, mp.x3 ?? 1940, mp.x4 ?? 5980],
+            globalGainDb: mp.globalGain ?? 0,
+            mix: Math.max(0, Math.min(1, (mp.mix ?? 100) / 100)),
+            bands: [0, 1, 2, 3, 4].map((b) => ({
+              lowThresh: mp[`b${b}_lowThresh`] ?? (-12 - b * 2),
+              ratio: mp[`b${b}_ratio`] ?? 2.0,
+              gainDb: mp[`b${b}_gain`] ?? 0,
+              attackMs: autoSp ? 10 : mp[`b${b}_attack`] ?? 12,
+              releaseMs: autoSp ? 110 : mp[`b${b}_release`] ?? 120,
+              bypass: (mp[`b${b}_bypass`] ?? 0) === 1,
+              mute: (mp[`b${b}_mute`] ?? 0) === 1,
+            })),
           });
         } else {
-          nodes.harmonyWetGain.gain.setTargetAtTime(0, now, 0.008);
+          nodes.multibandNode.port.postMessage({ enabled: false });
         }
       }
+
+      // Sidechain Ducking AudioWorklet (keyed from VOCAL ch-3)
+      const duckIns = ch.inserts.find((i) => i.type === 'ducking');
+      if (nodes.duckingNode) {
+        if (duckIns && duckIns.enabled) {
+          const dp = duckIns.params;
+          nodes.duckingNode.port.postMessage({
+            enabled: true,
+            thresholdDb: dp.threshold ?? -24,
+            depthDb: dp.depth ?? -6,
+            attackMs: dp.attack ?? 8,
+            releaseMs: dp.release ?? 180,
+          });
+        } else {
+          nodes.duckingNode.port.postMessage({ enabled: false });
+          this.duckDbMap.set(ch.id, 0);
+        }
+      }
+
+      // Wider Stereo Imager 2x2 M/S + Rotation + Polarity + Swap Matrix
+      const widerIns = ch.inserts.find((i) => i.type === 'wider' && i.enabled);
+      if (nodes.widerLL && nodes.widerLR && nodes.widerRL && nodes.widerRR) {
+        if (widerIns) {
+          const wp = widerIns.params;
+          const gainLin = dbToLinear(wp.gain ?? 0);
+          const widthFactor = Math.max(0, Math.min(3, wp.widthFactor ?? ((wp.width ?? 135) / 100)));
+          const asym = Math.max(-90, Math.min(90, wp.asymmetry ?? 0)) / 90;
+          const rotRad = (Math.max(-45, Math.min(45, wp.rotation ?? 0)) * Math.PI) / 180;
+          const pL = (wp.phaseL ?? 0) === 1 ? -1 : 1;
+          const pR = (wp.phaseR ?? 0) === 1 ? -1 : 1;
+          const swap = (wp.swapLR ?? 0) === 1;
+
+          const same = 0.5 + 0.5 * widthFactor;
+          const cross = 0.5 - 0.5 * widthFactor;
+          const cosR = Math.cos(rotRad);
+          const sinR = Math.sin(rotRad);
+          const leftTilt = (asym > 0 ? 1 - 0.5 * asym : 1) * gainLin;
+          const rightTilt = (asym < 0 ? 1 + 0.5 * asym : 1) * gainLin;
+
+          // Matrix before swap: [same, cross; cross, same] rotated by rotRad
+          const mLL = (same * cosR - cross * sinR) * leftTilt;
+          const mRL = (cross * cosR - same * sinR) * leftTilt;
+          const mLR = (same * sinR + cross * cosR) * rightTilt;
+          const mRR = (cross * sinR + same * cosR) * rightTilt;
+
+          if (swap) {
+            nodes.widerLL.gain.setTargetAtTime(mRL * pR, now, 0.01);
+            nodes.widerRL.gain.setTargetAtTime(mLL * pL, now, 0.01);
+            nodes.widerLR.gain.setTargetAtTime(mRR * pR, now, 0.01);
+            nodes.widerRR.gain.setTargetAtTime(mLR * pL, now, 0.01);
+          } else {
+            nodes.widerLL.gain.setTargetAtTime(mLL * pL, now, 0.01);
+            nodes.widerRL.gain.setTargetAtTime(mRL * pR, now, 0.01);
+            nodes.widerLR.gain.setTargetAtTime(mLR * pL, now, 0.01);
+            nodes.widerRR.gain.setTargetAtTime(mRR * pR, now, 0.01);
+          }
+        } else {
+          nodes.widerLL.gain.setTargetAtTime(1, now, 0.01);
+          nodes.widerRL.gain.setTargetAtTime(0, now, 0.01);
+          nodes.widerLR.gain.setTargetAtTime(0, now, 0.01);
+          nodes.widerRR.gain.setTargetAtTime(1, now, 0.01);
+        }
+      }
+
+      // Harmony 1-4 Voice Polyphonic Pitch-Shifter Worklet
+      const harmIns = ch.inserts.find((i) => i.type === 'harmony');
+      if (nodes.harmonyNode && nodes.harmonyFormantFilter) {
+        if (harmIns && harmIns.enabled) {
+          const hp = harmIns.params;
+          const vCount = Math.max(1, Math.min(4, Math.round(hp.voiceCount ?? 2)));
+          const defaultIntervals = [4, 7, -5, 12];
+          const defaultPans = [-35, 35, -65, 65];
+          const defaultLevels = [-2, -3, -5, -6];
+          const defaultDetunes = [8, -8, 12, -12];
+
+          const voices = [0, 1, 2, 3].map((v) => {
+            const st = hp[`v${v}_interval`] ?? defaultIntervals[v];
+            const cents = hp[`v${v}_detune`] ?? defaultDetunes[v];
+            const ratio = Math.pow(2, (st + cents / 100) / 12);
+            const panNorm = Math.max(-1, Math.min(1, (hp[`v${v}_pan`] ?? defaultPans[v]) / 100));
+            const angle = ((panNorm + 1) * Math.PI) / 4;
+            const levelDb = hp[`v${v}_level`] ?? defaultLevels[v];
+            return {
+              active: v < vCount,
+              ratio,
+              gain: dbToLinear(levelDb) * 0.72,
+              panL: Math.cos(angle),
+              panR: Math.sin(angle),
+            };
+          });
+
+          const formantSt = hp.formant ?? 0;
+          nodes.harmonyFormantFilter.gain.setTargetAtTime(
+            Math.max(-10, Math.min(10, formantSt * 0.75)),
+            now,
+            0.015
+          );
+
+          nodes.harmonyNode.port.postMessage({
+            enabled: true,
+            dryGain: Math.max(0, Math.min(1, (hp.dryLevel ?? (ch.type === 'fx' ? 0 : 100)) / 100)),
+            wetMix: Math.max(0, Math.min(1.2, (hp.mix ?? 75) / 100)),
+            width: Math.max(0, Math.min(2, (hp.width ?? 110) / 100)),
+            humanize: Math.max(0, Math.min(1, (hp.humanize ?? 25) / 100)),
+            voices,
+          });
+        } else {
+          nodes.harmonyFormantFilter.gain.setTargetAtTime(0, now, 0.015);
+          nodes.harmonyNode.port.postMessage({ enabled: false });
+        }
+      }
+
+      // Reverb Insert / Bus DSP (Pre-delay, Size/Damping IR, Lowpass Damping, Gate, M/S Width, Mix)
+      const revIns = ch.inserts.find((i) => i.type === 'reverb' && i.enabled);
+      let revMixNorm = 0;
+      if (revIns && nodes.revPreDelay && nodes.revWetGain && nodes.revDampFilter) {
+        const rp = revIns.params;
+        revMixNorm = Math.max(0, Math.min(1, (rp.mix ?? 100) / 100));
+        const preDelaySec = Math.max(0, Math.min(0.45, (rp.preDelay ?? 70) / 1000));
+        const sizeVal = Math.max(0, Math.min(100, rp.size ?? 80));
+        const dampingVal = Math.max(0, Math.min(100, rp.damping ?? 0));
+        const dampHz = 18000 * Math.pow(0.05, dampingVal / 100);
+        const widthNorm = Math.max(0, Math.min(2, (rp.width ?? 90) / 100));
+
+        nodes.revPreDelay.delayTime.setTargetAtTime(preDelaySec, now, 0.008);
+        nodes.revDampFilter.frequency.setTargetAtTime(Math.max(400, Math.min(nyquist, dampHz)), now, 0.015);
+        nodes.revWetGain.gain.setTargetAtTime(revMixNorm, now, 0.008);
+
+        if (nodes.revWidthLL && nodes.revWidthRR && nodes.revWidthLR && nodes.revWidthRL) {
+          const sameGain = 0.5 + 0.5 * widthNorm;
+          const crossGain = 0.5 - 0.5 * widthNorm;
+          nodes.revWidthLL.gain.setTargetAtTime(sameGain, now, 0.01);
+          nodes.revWidthRR.gain.setTargetAtTime(sameGain, now, 0.01);
+          nodes.revWidthLR.gain.setTargetAtTime(crossGain, now, 0.01);
+          nodes.revWidthRL.gain.setTargetAtTime(crossGain, now, 0.01);
+        }
+
+        if (nodes.revGateNode) {
+          const gateOn = (rp.gateOn ?? 0) === 1;
+          nodes.revGateNode.port.postMessage({
+            enabled: gateOn,
+            thresholdDb: rp.gateThreshold ?? -12,
+            rangeDb: -60,
+            attackMs: 3,
+            holdMs: 25,
+            releaseMs: rp.gateRelease ?? 150,
+            lookAhead: false,
+            ducking: false,
+            scFilter: false,
+          });
+        }
+
+        // Debounced IR regeneration when Size or Damping shifts meaningfully
+        if (
+          nodes.fxConvolver &&
+          (Math.abs(sizeVal - (nodes.revIrSize ?? 80)) >= 3 ||
+            Math.abs(dampingVal - (nodes.revIrDamping ?? 0)) >= 4)
+        ) {
+          nodes.revIrSize = sizeVal;
+          nodes.revIrDamping = dampingVal;
+          if (nodes.revIrTimer !== undefined) {
+            window.clearTimeout(nodes.revIrTimer);
+          }
+          nodes.revIrTimer = window.setTimeout(() => {
+            if (!this.ctx || !nodes.fxConvolver) return;
+            const dur = 0.4 + (sizeVal / 100) * 4.6;
+            const dec = 1.6 + (sizeVal / 100) * 1.4;
+            nodes.fxConvolver.buffer = createImpulseResponse(this.ctx, dur, dec, dampHz);
+          }, 110);
+        }
+      } else if (nodes.revWetGain) {
+        nodes.revWetGain.gain.setTargetAtTime(0, now, 0.008);
+      }
+
+      // Stereo Ping-Pong Delay DSP (BPM Sync, Offset, Feedback, PingPong, Swap, Width, CrossDelay, InPan, PongFactor, Low/Hi Cut, Mix)
+      const delIns = ch.inserts.find((i) => i.type === 'delay' && i.enabled);
+      let delMixNorm = 0;
+      if (delIns && nodes.delayNodeL && nodes.delayNodeR && nodes.delayWetGain) {
+        const dp = delIns.params;
+        delMixNorm = Math.max(0, Math.min(1, (dp.mix ?? 100) / 100));
+        const beatsIdx = Math.max(0, Math.min(DELAY_BEAT_MULTS.length - 1, Math.round(dp.beatsIdx ?? 4)));
+        const pongIdx = Math.max(0, Math.min(PONG_FACTOR_MULTS.length - 1, Math.round(dp.pongFactor ?? 3)));
+        const offsetMs = dp.offset ?? 0;
+        const quarterMs = 60000 / Math.max(30, bpm);
+        const baseSec = Math.max(0.01, Math.min(2.2, (quarterMs * DELAY_BEAT_MULTS[beatsIdx] + offsetMs) / 1000));
+        const pongSec = Math.max(0.01, Math.min(2.4, baseSec * PONG_FACTOR_MULTS[pongIdx]));
+        const fb = Math.max(0, Math.min(0.95, (dp.feedback ?? 17) / 100));
+        const cross = Math.max(0, Math.min(1, (dp.crossDelay ?? 0) / 100));
+        const pingPongMode = Math.round(dp.pingPong ?? 2); // 0: Off, 1: Sum, 2: 2-Ch
+        const swap = (dp.swap ?? 0) === 1;
+        const inPan = Math.max(-1, Math.min(1, (dp.inPan ?? 0) / 100));
+        const loCutHz = Math.max(20, Math.min(nyquist, dp.lowCut ?? 140));
+        const hiCutHz = Math.max(300, Math.min(nyquist, dp.hiCut ?? dp.tone ?? 4470));
+        const widthNorm = Math.max(0, Math.min(2, (dp.width ?? 100) / 100));
+
+        nodes.delayInPan?.pan.setTargetAtTime(inPan, now, 0.01);
+        nodes.delayLoCutL?.frequency.setTargetAtTime(loCutHz, now, 0.012);
+        nodes.delayLoCutR?.frequency.setTargetAtTime(loCutHz, now, 0.012);
+        nodes.delayHiCutL?.frequency.setTargetAtTime(hiCutHz, now, 0.012);
+        nodes.delayHiCutR?.frequency.setTargetAtTime(hiCutHz, now, 0.012);
+        nodes.delayWetGain.gain.setTargetAtTime(delMixNorm, now, 0.008);
+
+        if (pingPongMode === 0) {
+          // Dual Stereo / Mono Offset Off
+          const t = swap ? pongSec : baseSec;
+          nodes.delayNodeL.delayTime.setTargetAtTime(t, now, 0.015);
+          nodes.delayNodeR.delayTime.setTargetAtTime(t, now, 0.015);
+          nodes.delayInLL?.gain.setTargetAtTime(1, now, 0.01);
+          nodes.delayInLR?.gain.setTargetAtTime(0, now, 0.01);
+          nodes.delayInRL?.gain.setTargetAtTime(0, now, 0.01);
+          nodes.delayInRR?.gain.setTargetAtTime(1, now, 0.01);
+          nodes.delayFbLL?.gain.setTargetAtTime(fb * (1 - cross), now, 0.01);
+          nodes.delayFbRR?.gain.setTargetAtTime(fb * (1 - cross), now, 0.01);
+          nodes.delayFbLR?.gain.setTargetAtTime(fb * cross, now, 0.01);
+          nodes.delayFbRL?.gain.setTargetAtTime(fb * cross, now, 0.01);
+        } else if (pingPongMode === 1) {
+          // Ping-Pong Sum
+          nodes.delayNodeL.delayTime.setTargetAtTime(swap ? pongSec : baseSec, now, 0.015);
+          nodes.delayNodeR.delayTime.setTargetAtTime(swap ? baseSec : pongSec, now, 0.015);
+          nodes.delayInLL?.gain.setTargetAtTime(swap ? 0 : 0.707, now, 0.01);
+          nodes.delayInRL?.gain.setTargetAtTime(swap ? 0 : 0.707, now, 0.01);
+          nodes.delayInLR?.gain.setTargetAtTime(swap ? 0.707 : 0, now, 0.01);
+          nodes.delayInRR?.gain.setTargetAtTime(swap ? 0.707 : 0, now, 0.01);
+          nodes.delayFbLR?.gain.setTargetAtTime(fb, now, 0.01);
+          nodes.delayFbRL?.gain.setTargetAtTime(fb, now, 0.01);
+          nodes.delayFbLL?.gain.setTargetAtTime(fb * cross, now, 0.01);
+          nodes.delayFbRR?.gain.setTargetAtTime(fb * cross, now, 0.01);
+        } else {
+          // Ping-Pong 2-Ch
+          nodes.delayNodeL.delayTime.setTargetAtTime(swap ? pongSec : baseSec, now, 0.015);
+          nodes.delayNodeR.delayTime.setTargetAtTime(swap ? baseSec : pongSec, now, 0.015);
+          nodes.delayInLL?.gain.setTargetAtTime(swap ? 0 : 1, now, 0.01);
+          nodes.delayInRL?.gain.setTargetAtTime(swap ? 1 : 0, now, 0.01);
+          nodes.delayInLR?.gain.setTargetAtTime(swap ? 1 : 0, now, 0.01);
+          nodes.delayInRR?.gain.setTargetAtTime(swap ? 0 : 1, now, 0.01);
+          nodes.delayFbLR?.gain.setTargetAtTime(fb, now, 0.01);
+          nodes.delayFbRL?.gain.setTargetAtTime(fb, now, 0.01);
+          nodes.delayFbLL?.gain.setTargetAtTime(fb * cross, now, 0.01);
+          nodes.delayFbRR?.gain.setTargetAtTime(fb * cross, now, 0.01);
+        }
+
+        if (nodes.delayWidthLL && nodes.delayWidthRR && nodes.delayWidthLR && nodes.delayWidthRL) {
+          const sameGain = 0.5 + 0.5 * widthNorm;
+          const crossGain = 0.5 - 0.5 * widthNorm;
+          nodes.delayWidthLL.gain.setTargetAtTime(sameGain, now, 0.01);
+          nodes.delayWidthRR.gain.setTargetAtTime(sameGain, now, 0.01);
+          nodes.delayWidthLR.gain.setTargetAtTime(crossGain, now, 0.01);
+          nodes.delayWidthRL.gain.setTargetAtTime(crossGain, now, 0.01);
+        }
+      } else if (nodes.delayWetGain) {
+        nodes.delayFbLL?.gain.setTargetAtTime(0, now, 0.01);
+        nodes.delayFbRR?.gain.setTargetAtTime(0, now, 0.01);
+        nodes.delayFbLR?.gain.setTargetAtTime(0, now, 0.01);
+        nodes.delayFbRL?.gain.setTargetAtTime(0, now, 0.01);
+        nodes.delayWetGain.gain.setTargetAtTime(0, now, 0.008);
+      }
+
+      // Dry gain balance: 0% dry leak when Reverb or Delay mix = 100%
+      const wetMixMax = Math.max(revMixNorm, delMixNorm);
+      nodes.revDryGain.gain.setTargetAtTime(Math.max(0, 1 - wetMixMax), now, 0.008);
 
       // Pan (-100..100 -> -1..1) with ultra-low-latency smoothing
       nodes.panner.pan.setTargetAtTime(Math.max(-1, Math.min(1, ch.pan / 100)), now, 0.004);
@@ -1522,10 +2402,18 @@ export class StudioAudioEngine {
       osc.stop(time + 0.06);
     }
 
+    const anySolo = this.channelsSnapshot.some((c) => c.solo && c.type !== 'master' && c.type !== 'listen');
+
     // Channel 2: MUSIK (Punchy kick/snare/hihat + warm bass groove)
     const ch2 = this.channelNodes.get('ch-2');
     const ch2State = this.channelsSnapshot.find((c) => c.id === 'ch-2');
-    if (ch2 && ch2State?.inputSource === 'demo') {
+    const ch2Playable =
+      ch2 &&
+      ch2State?.inputSource === 'demo' &&
+      ch2State.monitor &&
+      !ch2State.mute &&
+      (!anySolo || ch2State.solo);
+    if (ch2 && ch2Playable) {
       if (step % 4 === 0) {
         // Kick
         const osc = ctx.createOscillator();
@@ -1577,7 +2465,13 @@ export class StudioAudioEngine {
     // Channel 3: VOCAL (Lead Melody / Formant Synth Voice)
     const ch3 = this.channelNodes.get('ch-3');
     const ch3State = this.channelsSnapshot.find((c) => c.id === 'ch-3');
-    if (ch3 && ch3State?.inputSource === 'demo' && (step === 0 || step === 3 || step === 6 || step === 10 || step === 14)) {
+    const ch3Playable =
+      ch3 &&
+      ch3State?.inputSource === 'demo' &&
+      ch3State.monitor &&
+      !ch3State.mute &&
+      (!anySolo || ch3State.solo);
+    if (ch3 && ch3Playable && (step === 0 || step === 3 || step === 6 || step === 10 || step === 14)) {
       const melody = [440, 523.25, 587.33, 659.25, 523.25];
       const idx = [0, 3, 6, 10, 14].indexOf(step);
       const osc = ctx.createOscillator();
@@ -1594,7 +2488,16 @@ export class StudioAudioEngine {
 
     // Any additional channels switched to Demo Stem play subtle stereo chord accent
     for (const ch of this.channelsSnapshot) {
-      if (ch.type === 'audio' && ch.id !== 'ch-2' && ch.id !== 'ch-3' && ch.inputSource === 'demo' && (step === 0 || step === 8)) {
+      if (
+        ch.type === 'audio' &&
+        ch.id !== 'ch-2' &&
+        ch.id !== 'ch-3' &&
+        ch.inputSource === 'demo' &&
+        ch.monitor &&
+        !ch.mute &&
+        (!anySolo || ch.solo) &&
+        (step === 0 || step === 8)
+      ) {
         const nodes = this.channelNodes.get(ch.id);
         if (!nodes) continue;
         const osc = ctx.createOscillator();
@@ -1642,7 +2545,11 @@ export class StudioAudioEngine {
   }
 
   public updateTransportSnapshot(transport: TransportState): void {
+    const prevBpm = this.transportSnapshot?.bpm;
     this.transportSnapshot = transport;
+    if (prevBpm !== undefined && prevBpm !== transport.bpm && this.channelsSnapshot.length > 0) {
+      this.syncParameters(this.channelsSnapshot);
+    }
   }
 
   public clearClip(channelId: string): void {
@@ -1722,10 +2629,81 @@ export class StudioAudioEngine {
     return this.fftBuf;
   }
 
+  public getChannelSpectrumDb(
+    channelId: string,
+    channelMode: 'L+R' | 'L' | 'R' | 'M' | 'S' = 'L+R'
+  ): { binsDb: Float32Array; sampleRate: number; fftSize: number } {
+    const nodes = this.channelNodes.get(channelId) ?? this.channelNodes.get('main-bus');
+    const sampleRate = this.ctx?.sampleRate ?? 48000;
+    if (!nodes) {
+      this.floatFftBufOut.fill(-100);
+      return { binsDb: this.floatFftBufOut, sampleRate, fftSize: 8192 };
+    }
+    const binCount = nodes.analyserL.frequencyBinCount;
+    if (this.floatFftBufL.length !== binCount) {
+      this.floatFftBufL = new Float32Array(binCount);
+      this.floatFftBufR = new Float32Array(binCount);
+      this.floatFftBufOut = new Float32Array(binCount);
+    }
+
+    if (channelMode === 'L') {
+      nodes.analyserL.getFloatFrequencyData(this.floatFftBufOut);
+      return { binsDb: this.floatFftBufOut, sampleRate, fftSize: nodes.analyserL.fftSize };
+    }
+    if (channelMode === 'R') {
+      nodes.analyserR.getFloatFrequencyData(this.floatFftBufOut);
+      return { binsDb: this.floatFftBufOut, sampleRate, fftSize: nodes.analyserR.fftSize };
+    }
+
+    nodes.analyserL.getFloatFrequencyData(this.floatFftBufL);
+    nodes.analyserR.getFloatFrequencyData(this.floatFftBufR);
+
+    for (let i = 0; i < binCount; i++) {
+      const dbL = Number.isFinite(this.floatFftBufL[i]) ? this.floatFftBufL[i] : -100;
+      const dbR = Number.isFinite(this.floatFftBufR[i]) ? this.floatFftBufR[i] : -100;
+      if (channelMode === 'S') {
+        const ampL = Math.pow(10, dbL / 20);
+        const ampR = Math.pow(10, dbR / 20);
+        const diff = Math.abs(ampL - ampR);
+        this.floatFftBufOut[i] = diff > 1e-5 ? Math.max(-100, 20 * Math.log10(diff)) : -100;
+      } else {
+        const pL = Math.pow(10, dbL / 10);
+        const pR = Math.pow(10, dbR / 10);
+        this.floatFftBufOut[i] = Math.max(-100, 10 * Math.log10(0.5 * (pL + pR)));
+      }
+    }
+    return { binsDb: this.floatFftBufOut, sampleRate, fftSize: nodes.analyserL.fftSize };
+  }
+
   public getChannelReduction(channelId: string): number {
     const nodes = this.channelNodes.get(channelId);
     if (!nodes) return 0;
-    return Math.min(0, nodes.compressor.reduction ?? 0);
+    const mix = this.compMixMap.get(channelId) ?? 0;
+    return Math.min(0, (nodes.compressor.reduction ?? 0) * mix);
+  }
+
+  public getChannelGateAttenuation(channelId: string): number {
+    return this.gateAttenMap.get(channelId) ?? 0;
+  }
+
+  public getChannelSaturationMetrics(channelId: string): {
+    driveDb: number;
+    satAmount: number;
+    inRmsDb: number;
+    outRmsDb: number;
+  } {
+    return (
+      this.satMetricsMap.get(channelId) ?? {
+        driveDb: 0,
+        satAmount: 0,
+        inRmsDb: -60,
+        outRmsDb: -60,
+      }
+    );
+  }
+
+  public getChannelDuckingDb(channelId: string): number {
+    return this.duckDbMap.get(channelId) ?? 0;
   }
 
   public getChannelStereoMetrics(channelId: string): {

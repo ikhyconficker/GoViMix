@@ -17,6 +17,7 @@ export type PluginType =
   | 'wider'
   | 'ducking'
   | 'multiband'
+  | 'saturation'
   | 'special-fx';
 
 export type SpecialEffectPreset =

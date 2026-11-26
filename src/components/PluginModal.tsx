@@ -11,6 +11,7 @@ import { LimiterModal } from './LimiterModal';
 import { MultibandDynamicsModal } from './MultibandDynamicsModal';
 import { ReverbModal } from './ReverbModal';
 import { RotaryKnob } from './RotaryKnob';
+import { SaturationModal } from './SaturationModal';
 import { SpecialEffectModal } from './SpecialEffectModal';
 import { SpectrumModal } from './SpectrumModal';
 import { VuMeterModal } from './VuMeterModal';
@@ -49,6 +50,7 @@ export const PluginModal: React.FC<PluginModalProps> = ({
     plugin.type === 'gate' ||
     plugin.type === 'delay' ||
     plugin.type === 'harmony' ||
+    plugin.type === 'saturation' ||
     plugin.type === 'special-fx' ||
     isVuMeter;
 
@@ -149,6 +151,27 @@ export const PluginModal: React.FC<PluginModalProps> = ({
             }
             ctx.stroke();
             ctx.shadowBlur = 0;
+          } else if (plugin.type === 'ducking') {
+            const duckDb = plugin.enabled ? audioEngine.getChannelDuckingDb(channel.id) : 0;
+            const thresh = plugin.params.threshold ?? -24;
+            const depth = plugin.params.depth ?? -6;
+
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '11px ui-monospace, monospace';
+            ctx.fillText(`Sidechain Key: VOCAL (Thresh ${thresh.toFixed(0)} dB / Depth ${depth.toFixed(0)} dB)`, 12, 22);
+
+            const barW = w - 24;
+            const barH = 18;
+            const barY = h - 38;
+            ctx.fillStyle = '#121824';
+            ctx.fillRect(12, barY, barW, barH);
+            const ratio = Math.min(1, Math.abs(duckDb) / 24);
+            ctx.fillStyle = '#f59e0b';
+            ctx.fillRect(12 + barW * (1 - ratio), barY, barW * ratio, barH);
+            ctx.fillStyle = '#f8fafc';
+            ctx.textAlign = 'right';
+            ctx.fillText(`Duck GR: ${duckDb.toFixed(1)} dB`, w - 14, barY - 8);
+            ctx.textAlign = 'left';
           }
         }
       }
@@ -271,6 +294,17 @@ export const PluginModal: React.FC<PluginModalProps> = ({
   if (plugin.type === 'harmony') {
     return (
       <HarmonyModal
+        channel={channel}
+        plugin={plugin}
+        onClose={onClose}
+        onUpdatePlugin={onUpdatePlugin}
+      />
+    );
+  }
+
+  if (plugin.type === 'saturation') {
+    return (
+      <SaturationModal
         channel={channel}
         plugin={plugin}
         onClose={onClose}

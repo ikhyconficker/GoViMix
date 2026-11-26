@@ -25,6 +25,7 @@ export const GateModal: React.FC<GateModalProps> = ({
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const draggingRef = useRef(false);
+  const lastAttenRef = useRef(0);
   const [gateAttenDb, setGateAttenDb] = useState(0);
 
   const p = plugin.params;
@@ -129,12 +130,19 @@ export const GateModal: React.FC<GateModalProps> = ({
           }
           ctx.stroke();
 
-          // Live input level & gate reduction indicator
+          // Real-time audio worklet gate reduction + live input level
+          const workletAtten = plugin.enabled ? audioEngine.getChannelGateAttenuation(channel.id) : 0;
           const metrics = audioEngine.getChannelStereoMetrics(channel.id);
           const inDb = Math.max(-60, Math.min(0, linearToDb(Math.max(metrics.peakL, metrics.peakR))));
-          const isGating = plugin.enabled && (ducking ? inDb >= threshold : inDb < threshold);
-          const liveAtten = isGating ? Math.abs(range) : 0;
-          setGateAttenDb(liveAtten);
+          const liveAtten = workletAtten > 0.05
+            ? workletAtten
+            : plugin.enabled && (ducking ? inDb >= threshold : inDb < threshold) && inDb > -59.5
+            ? Math.abs(range)
+            : 0;
+          if (Math.abs(liveAtten - lastAttenRef.current) >= 0.1) {
+            lastAttenRef.current = liveAtten;
+            setGateAttenDb(liveAtten);
+          }
 
           // Yellow gate attenuation bar on left of graph (like image 2)
           const attenNorm = Math.min(1, liveAtten / 48);

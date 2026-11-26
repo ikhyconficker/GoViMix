@@ -82,11 +82,33 @@ export default function App() {
       tintBg: initTheme.tintBg,
     };
     if (parsed && Array.isArray(parsed.channels) && parsed.channels.length > 0) {
+      const needsVocalSaturationSeed = parsed.satVocalSeeded !== true;
+      const satCatalog = PLUGIN_CATALOG.find((p) => p.type === 'saturation');
       let nextIdx = 1;
       return (parsed.channels as ChannelState[])
         .filter((ch) => !(ch.id === 'ch-1' && ch.name === 'RECORD'))
         .map((ch) => {
           const idx = ch.type === 'audio' || ch.type === 'fx' ? nextIdx++ : ch.index;
+          let nextInserts = ch.inserts;
+          if (
+            needsVocalSaturationSeed &&
+            ch.id === 'ch-3' &&
+            !ch.inserts.some((ins) => ins.type === 'saturation') &&
+            satCatalog
+          ) {
+            nextInserts = [
+              ...ch.inserts,
+              {
+                id: 'ins-3-4',
+                name: satCatalog.name,
+                format: satCatalog.format,
+                vendor: satCatalog.vendor,
+                type: satCatalog.type,
+                enabled: true,
+                params: { ...satCatalog.defaultParams },
+              },
+            ];
+          }
           // In-memory File AudioBuffers do not persist across browser reloads
           if (ch.inputSource === 'file') {
             const fallbackDemo = ch.id === 'ch-2' || ch.id === 'ch-3';
@@ -94,6 +116,7 @@ export default function App() {
               ...ch,
               index: idx,
               ...themeColor,
+              inserts: nextInserts,
               inputSource: fallbackDemo ? 'demo' : 'none',
               inputLabel: fallbackDemo ? `Stem In ${idx}` : 'None',
               audioFileName: undefined,
@@ -103,6 +126,7 @@ export default function App() {
             ...ch,
             index: idx,
             ...themeColor,
+            inserts: nextInserts,
           };
         });
     }
@@ -286,6 +310,7 @@ export default function App() {
           specialEffectPads,
           themePresetId,
           customNeonHex,
+          satVocalSeeded: true,
         })
       );
     } catch {
@@ -424,9 +449,22 @@ export default function App() {
       }
     } else if (target.inputSource === 'file') {
       if (nextMonitor) {
-        await audioEngine.playFileForChannel(channelId, cfg.sampleRate, true);
+        const started = await audioEngine.playFileForChannel(channelId, cfg.sampleRate, true);
+        if (!started) {
+          showTemporaryNotice('Belum ada file musik dimuat. Pilih File Musik (.mp3 / .wav) dulu.');
+          return;
+        }
+        setTransport((t) => ({ ...t, isPlaying: true }));
       } else {
         audioEngine.stopFileForChannel(channelId);
+        const anyPlaying =
+          channelsRef.current.some(
+            (c) => c.id !== channelId && c.monitor && (c.inputSource === 'demo' || audioEngine.isFilePlaying(c.id))
+          );
+        if (!anyPlaying) {
+          audioEngine.stopPlayback();
+          setTransport((t) => ({ ...t, isPlaying: false }));
+        }
       }
     } else if (target.inputSource === 'demo') {
       if (!transportRef.current.isPlaying) {
@@ -445,8 +483,10 @@ export default function App() {
         );
         channelsRef.current = nextChannels;
         setChannels(nextChannels);
+        audioEngine.syncParameters(nextChannels);
         const anyDemoMonitored = nextChannels.some((c) => c.inputSource === 'demo' && c.monitor);
-        if (!anyDemoMonitored) {
+        const anyFilePlaying = nextChannels.some((c) => audioEngine.isFilePlaying(c.id));
+        if (!anyDemoMonitored && !anyFilePlaying) {
           audioEngine.stopPlayback();
           setTransport((t) => ({ ...t, isPlaying: false }));
         }
@@ -455,6 +495,35 @@ export default function App() {
     }
 
     updateChannel(channelId, (c) => ({ ...c, monitor: nextMonitor }));
+  };
+
+  const handleTogglePlayback = async () => {
+    if (transportRef.current.isPlaying) {
+      audioEngine.stopPlayback();
+      for (const ch of channelsRef.current) {
+        audioEngine.stopFileForChannel(ch.id);
+      }
+      setTransport((t) => ({ ...t, isPlaying: false }));
+      return;
+    }
+    const cfg = await ensureOutputReady();
+    let nextChannels = channelsRef.current;
+    const hasMonitoredDemo = nextChannels.some((c) => c.inputSource === 'demo' && c.monitor);
+    if (!hasMonitoredDemo && nextChannels.some((c) => c.inputSource === 'demo')) {
+      nextChannels = nextChannels.map((c) =>
+        c.inputSource === 'demo' ? { ...c, monitor: true, mute: false } : c
+      );
+      channelsRef.current = nextChannels;
+      setChannels(nextChannels);
+    }
+    for (const ch of nextChannels) {
+      if (ch.inputSource === 'file' && ch.monitor) {
+        await audioEngine.playFileForChannel(ch.id, cfg.sampleRate, true);
+      }
+    }
+    const nextT = { ...transportRef.current, isPlaying: true };
+    setTransport(nextT);
+    await audioEngine.startPlayback(nextT, nextChannels, cfg);
   };
 
   const handleSelectInput = async (
@@ -920,6 +989,8 @@ export default function App() {
         cpuMetrics={cpuMetrics}
         recordedAudioUrl={recordedAudioUrl}
         activeTheme={activeTheme}
+        isPlaying={transport.isPlaying}
+        onTogglePlayback={handleTogglePlayback}
         onOpenThemeModal={() => setShowThemeModal(true)}
         onOpenAsioModal={() => setShowAsioModal(true)}
         onOpenDesktopModal={() => setShowDesktopModal(true)}

@@ -100,12 +100,12 @@ export const EqualizerModal: React.FC<EqualizerModalProps> = ({
   });
 
   const lcOn = getVal('lc_on', 1) === 1;
-  const lcFreq = getVal('lc_freq', getVal('lowCut', 28));
+  const lcFreq = getVal('lc_freq', getVal('lowCut', 60));
   const lcSlope = getVal('lc_slope', 12);
 
   const hcOn = getVal('hc_on', 1) === 1;
-  const hcFreq = getVal('hc_freq', 16260);
-  const hcSlope = getVal('hc_slope', 24);
+  const hcFreq = getVal('hc_freq', 18000);
+  const hcSlope = getVal('hc_slope', 12);
 
   const llcOn = getVal('llc_on', 0) === 1;
   const llcHz = getVal('llc_hz', 50);
@@ -194,34 +194,51 @@ export const EqualizerModal: React.FC<EqualizerModalProps> = ({
             ctx.stroke();
           });
 
-          // Real-Time FFT Spectrum Overlay
-          const liveFft = audioEngine.getMasterSpectrum();
+          // Real-Time High-Res Float dBFS Channel FFT Spectrum Overlay
+          const spec = audioEngine.getChannelSpectrumDb(channel.id, 'L+R');
+          const fftLen = spec.binsDb.length;
+          const binHz = spec.sampleRate / spec.fftSize;
+
+          const barCount = analyzerMode === 'FFT' ? 140 : analyzerMode === '12th Octave' ? 84 : 36;
+          if (!frozenFftRef.current || frozenFftRef.current.length !== barCount) {
+            if (!freezeSpectrum) frozenFftRef.current = null;
+          }
+          const liveBars = new Uint8Array(barCount);
+          for (let i = 0; i < barCount; i++) {
+            const fLow = normToFreq(i / barCount);
+            const fHigh = normToFreq((i + 1) / barCount);
+            const fMid = (fLow + fHigh) * 0.5;
+            const bStart = Math.max(1, Math.floor(fLow / binHz));
+            const bEnd = Math.min(fftLen - 1, Math.ceil(fHigh / binHz));
+            let peakDb = -100;
+            if (bEnd <= bStart + 1) {
+              const exact = Math.max(1, Math.min(fftLen - 1.001, fMid / binHz));
+              const b0 = Math.floor(exact);
+              const frac = exact - b0;
+              peakDb = spec.binsDb[b0] * (1 - frac) + spec.binsDb[b0 + 1] * frac;
+            } else {
+              for (let k = bStart; k <= bEnd; k++) {
+                if (spec.binsDb[k] > peakDb) peakDb = spec.binsDb[k];
+              }
+            }
+            const norm = Math.max(0, Math.min(1, (peakDb + 84) / 96));
+            liveBars[i] = Math.round(norm * 255);
+          }
+
           if (freezeSpectrum && !frozenFftRef.current) {
-            frozenFftRef.current = new Uint8Array(liveFft);
+            frozenFftRef.current = liveBars;
           } else if (!freezeSpectrum) {
             frozenFftRef.current = null;
           }
-          const fft = frozenFftRef.current ?? liveFft;
+          const bars = frozenFftRef.current ?? liveBars;
 
-          const barCount = analyzerMode === 'FFT' ? 120 : analyzerMode === '12th Octave' ? 72 : 36;
           for (let i = 0; i < barCount; i++) {
-            const f1 = normToFreq(i / barCount);
-            const f2 = normToFreq((i + 1) / barCount);
-            let sum = 0;
-            let cnt = 0;
-            for (let k = 0; k < fft.length; k++) {
-              const bf = (k / fft.length) * 24000;
-              if (bf >= f1 && bf <= f2) {
-                sum += fft[k];
-                cnt++;
-              }
-            }
-            const val = cnt > 0 ? sum / cnt / 255 : 0;
+            const val = bars[i] / 255;
             if (val > 0.01) {
               const x = (i / barCount) * w;
               const bw = Math.max(2, w / barCount - 1);
-              const bh = val * graphH * 0.78;
-              ctx.fillStyle = 'rgba(0, 229, 255, 0.14)';
+              const bh = val * graphH * 0.85;
+              ctx.fillStyle = 'rgba(0, 229, 255, 0.17)';
               ctx.fillRect(x, graphH - bh, bw, bh);
             }
           }

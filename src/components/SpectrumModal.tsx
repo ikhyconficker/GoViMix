@@ -54,15 +54,18 @@ export const SpectrumModal: React.FC<SpectrumModalProps> = ({
   onUpdatePlugin,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const peakHoldRef = useRef<Float32Array>(new Float32Array(128).fill(0));
-  const avgBufRef = useRef<Float32Array>(new Float32Array(128).fill(0));
+  const peakHoldRef = useRef<Float32Array>(new Float32Array(256).fill(0));
+  const avgBufRef = useRef<Float32Array>(new Float32Array(256).fill(0));
   const waterfallRef = useRef<number[][]>([]);
+  const lastPeakUpdateRef = useRef<number>(0);
 
   const [channelMode, setChannelMode] = useState<'L+R' | 'L' | 'R' | 'M' | 'S'>('L+R');
-  const [holdMode, setHoldMode] = useState<'None' | 'Peak' | 'Infinite'>('None');
-  const [averageMode, setAverageMode] = useState<'Off' | 'Fast' | 'Medium' | 'Slow'>('Slow');
+  const [holdMode, setHoldMode] = useState<'None' | 'Peak' | 'Infinite'>('Peak');
+  const [averageMode, setAverageMode] = useState<'Off' | 'Fast' | 'Medium' | 'Slow'>('Medium');
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('12th Octave');
+  const [slopeDbOct, setSlopeDbOct] = useState<0 | 3 | 4.5>(3);
   const [fixedRange, setFixedRange] = useState(false);
+  const [livePeak, setLivePeak] = useState<{ freq: number; db: number; note: string } | null>(null);
   const [hoverInfo, setHoverInfo] = useState<{
     x: number;
     y: number;
@@ -109,10 +112,11 @@ export const SpectrumModal: React.FC<SpectrumModalProps> = ({
             ctx.stroke();
           }
 
-          // Sample live FFT
-          const fft = audioEngine.getChannelSpectrum(channel.id, channelMode);
-          const sampleRate = audioEngine.getContext()?.sampleRate ?? 48000;
-          const nyquist = sampleRate / 2;
+          // High-Resolution 8192-point Float dBFS FFT with fractional log-bin interpolation
+          const spec = audioEngine.getChannelSpectrumDb(channel.id, channelMode);
+          const binsDb = spec.binsDb;
+          const fftLen = binsDb.length;
+          const binHz = spec.sampleRate / spec.fftSize;
 
           const barCount =
             analysisMode === 'Octave'
@@ -120,31 +124,60 @@ export const SpectrumModal: React.FC<SpectrumModalProps> = ({
               : analysisMode === '3rd Octave'
               ? 31
               : analysisMode === '12th Octave'
-              ? 96
+              ? 120
               : analysisMode === 'Segments'
               ? 48
-              : 128;
+              : 240;
+
+          if (avgBufRef.current.length !== barCount) {
+            avgBufRef.current = new Float32Array(barCount).fill(0);
+            peakHoldRef.current = new Float32Array(barCount).fill(0);
+          }
 
           const smoothAlpha =
             averageMode === 'Off'
-              ? 0.9
+              ? 0.92
               : averageMode === 'Fast'
-              ? 0.45
+              ? 0.5
               : averageMode === 'Medium'
-              ? 0.22
-              : 0.12;
+              ? 0.28
+              : 0.14;
 
+          let framePeakDb = -100;
+          let framePeakFreq = 0;
           const currentFrame: number[] = [];
+
           for (let i = 0; i < barCount; i++) {
             const fLow = normToFreq(i / barCount);
             const fHigh = normToFreq((i + 1) / barCount);
-            const binStart = Math.max(1, Math.floor((fLow / nyquist) * fft.length));
-            const binEnd = Math.min(fft.length - 1, Math.max(binStart, Math.ceil((fHigh / nyquist) * fft.length)));
-            let maxVal = 0;
-            for (let b = binStart; b <= binEnd; b++) {
-              if (fft[b] > maxVal) maxVal = fft[b];
+            const fCenter = Math.sqrt(fLow * fHigh);
+            const bStart = Math.max(1, Math.floor(fLow / binHz));
+            const bEnd = Math.min(fftLen - 1, Math.ceil(fHigh / binHz));
+
+            let bandDb = -100;
+            if (bEnd <= bStart + 1) {
+              // Sub-bass & low-mid fractional bin interpolation for smooth 20-200Hz resolution
+              const exact = Math.max(1, Math.min(fftLen - 1.001, fCenter / binHz));
+              const b0 = Math.floor(exact);
+              const frac = exact - b0;
+              bandDb = binsDb[b0] * (1 - frac) + binsDb[b0 + 1] * frac;
+            } else {
+              // Integrate / peak energy across bin span
+              for (let b = bStart; b <= bEnd; b++) {
+                if (binsDb[b] > bandDb) bandDb = binsDb[b];
+              }
             }
-            const norm = plugin.enabled ? maxVal / 255 : 0;
+
+            if (plugin.enabled && bandDb > framePeakDb) {
+              framePeakDb = bandDb;
+              framePeakFreq = fCenter;
+            }
+
+            // Apply Slope tilt around 1 kHz (+0 / +3 / +4.5 dB/oct)
+            const tiltDb = slopeDbOct === 0 ? 0 : slopeDbOct * Math.log2(fCenter / 1000);
+            const displayDb = Math.max(-96, Math.min(12, bandDb + tiltDb));
+            const norm = plugin.enabled ? Math.max(0, Math.min(1, (displayDb + 96) / 108)) : 0;
+
             const prevAvg = avgBufRef.current[i] ?? 0;
             const smoothed = prevAvg + (norm - prevAvg) * smoothAlpha;
             avgBufRef.current[i] = smoothed;
@@ -153,9 +186,20 @@ export const SpectrumModal: React.FC<SpectrumModalProps> = ({
             if (holdMode === 'Infinite') {
               peakHoldRef.current[i] = Math.max(peakHoldRef.current[i], smoothed);
             } else if (holdMode === 'Peak') {
-              peakHoldRef.current[i] = Math.max(peakHoldRef.current[i] * 0.992, smoothed);
+              peakHoldRef.current[i] = Math.max(peakHoldRef.current[i] * 0.993, smoothed);
             } else {
               peakHoldRef.current[i] = 0;
+            }
+          }
+
+          const nowMs = performance.now();
+          if (nowMs - lastPeakUpdateRef.current >= 110) {
+            lastPeakUpdateRef.current = nowMs;
+            if (plugin.enabled && framePeakDb > -80 && framePeakFreq >= 20) {
+              const info = freqToNoteInfo(framePeakFreq);
+              setLivePeak({ freq: framePeakFreq, db: framePeakDb, note: info.note });
+            } else {
+              setLivePeak(null);
             }
           }
 
@@ -198,7 +242,7 @@ export const SpectrumModal: React.FC<SpectrumModalProps> = ({
             ctx.moveTo(0, plotH);
             currentFrame.forEach((v, idx) => {
               const x = (idx / (barCount - 1)) * w;
-              const y = plotH - v * (plotH * 0.9);
+              const y = plotH - v * plotH;
               ctx.lineTo(x, y);
             });
             ctx.lineTo(w, plotH);
@@ -212,20 +256,33 @@ export const SpectrumModal: React.FC<SpectrumModalProps> = ({
             ctx.beginPath();
             currentFrame.forEach((v, idx) => {
               const x = (idx / (barCount - 1)) * w;
-              const y = plotH - v * (plotH * 0.9);
+              const y = plotH - v * plotH;
               if (idx === 0) ctx.moveTo(x, y);
               else ctx.lineTo(x, y);
             });
             ctx.strokeStyle = '#38bdf8';
             ctx.lineWidth = 1.8;
             ctx.stroke();
+
+            if (holdMode !== 'None') {
+              ctx.beginPath();
+              for (let idx = 0; idx < barCount; idx++) {
+                const x = (idx / (barCount - 1)) * w;
+                const py = plotH - peakHoldRef.current[idx] * plotH;
+                if (idx === 0) ctx.moveTo(x, py);
+                else ctx.lineTo(x, py);
+              }
+              ctx.strokeStyle = 'rgba(186, 230, 253, 0.65)';
+              ctx.lineWidth = 1;
+              ctx.stroke();
+            }
           } else {
             // Octave / 3rd Octave / 12th Octave / Segments bars
             const bw = w / barCount;
             const gap = barCount > 60 ? 1 : 2;
             currentFrame.forEach((v, idx) => {
               const x = idx * bw;
-              const barH = v * (plotH * 0.9);
+              const barH = v * plotH;
               const y = plotH - barH;
               const grad = ctx.createLinearGradient(0, y, 0, plotH);
               grad.addColorStop(0, '#38bdf8');
@@ -235,7 +292,7 @@ export const SpectrumModal: React.FC<SpectrumModalProps> = ({
               ctx.fillRect(x, y, Math.max(1, bw - gap), barH);
 
               if (holdMode !== 'None' && peakHoldRef.current[idx] > 0.01) {
-                const py = plotH - peakHoldRef.current[idx] * (plotH * 0.9);
+                const py = plotH - peakHoldRef.current[idx] * plotH;
                 ctx.fillStyle = '#bae6fd';
                 ctx.fillRect(x, py, Math.max(1, bw - gap), 1.5);
               }
@@ -271,7 +328,7 @@ export const SpectrumModal: React.FC<SpectrumModalProps> = ({
     };
     raf = requestAnimationFrame(render);
     return () => cancelAnimationFrame(raf);
-  }, [analysisMode, averageMode, channel.id, channelMode, holdMode, hoverInfo, plugin.enabled]);
+  }, [analysisMode, averageMode, channel.id, channelMode, holdMode, hoverInfo, plugin.enabled, slopeDbOct]);
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
@@ -315,6 +372,11 @@ export const SpectrumModal: React.FC<SpectrumModalProps> = ({
               <Power className="w-3.5 h-3.5" />
             </button>
             <span className="text-[16px] font-normal text-white">Spectrum Meter</span>
+            <span className="text-[10.5px] font-mono-tabular px-2 py-0.5 rounded bg-[#0c1b20] border border-cyan-500/30 text-cyan-300">
+              {livePeak
+                ? `Peak: ${livePeak.freq >= 1000 ? `${(livePeak.freq / 1000).toFixed(2)}k` : `${Math.round(livePeak.freq)} Hz`} (${livePeak.note}) · ${livePeak.db.toFixed(1)} dB`
+                : 'Peak: -- Hz'}
+            </span>
           </div>
 
           <div className="flex items-center gap-3 text-[11px]">
@@ -334,7 +396,7 @@ export const SpectrumModal: React.FC<SpectrumModalProps> = ({
             </div>
 
             <div className="flex items-center gap-1">
-              <span className="text-slate-300 mr-0.5">Level Range</span>
+              <span className="text-slate-300 mr-0.5">Range</span>
               <span className="px-2 py-0.5 rounded bg-[#232730] border border-black/70 font-mono-tabular text-[#60a5fa]">
                 -96 dB
               </span>
@@ -366,11 +428,21 @@ export const SpectrumModal: React.FC<SpectrumModalProps> = ({
 
         {/* Spectrum Plot Area */}
         <div className="relative bg-[#061113] flex">
-          {/* Left dB Scale */}
-          <div className="w-8 flex flex-col justify-between py-1 pb-6 pr-1 text-right text-[9.5px] font-mono-tabular text-[#94a3b8]">
-            {[12, 6, 0, -6, -12, -18, -24, -36, -48, -72, -96].map((d) => (
-              <span key={d}>{d}</span>
-            ))}
+          {/* Left dB Scale — exact proportional Y mapping matching canvas plotH */}
+          <div className="relative w-9 h-[265px] pr-1.5 text-right text-[9.5px] font-mono-tabular text-[#94a3b8] shrink-0">
+            {[12, 6, 0, -6, -12, -18, -24, -36, -48, -72, -96].map((d) => {
+              const plotH = 265 - 18;
+              const yPx = ((12 - d) / 108) * plotH;
+              return (
+                <span
+                  key={d}
+                  className="absolute right-1.5 -translate-y-1/2 leading-none"
+                  style={{ top: `${Math.max(6, Math.min(plotH - 4, yPx))}px` }}
+                >
+                  {d}
+                </span>
+              );
+            })}
           </div>
 
           <div className="relative flex-1">
@@ -399,7 +471,7 @@ export const SpectrumModal: React.FC<SpectrumModalProps> = ({
         </div>
 
         {/* Frequency Axis Labels */}
-        <div className="relative h-5 bg-[#090d10] border-b border-black text-[9.5px] font-mono-tabular text-slate-300 pl-8">
+        <div className="relative h-5 bg-[#090d10] border-b border-black text-[9.5px] font-mono-tabular text-slate-300 pl-9">
           {[
             { f: 50, lbl: '50' },
             { f: 100, lbl: '100' },
@@ -413,14 +485,14 @@ export const SpectrumModal: React.FC<SpectrumModalProps> = ({
             <span
               key={item.f}
               className="absolute top-0.5 -translate-x-1/2"
-              style={{ left: `calc(32px + ${freqToNorm(item.f)} * (100% - 32px))` }}
+              style={{ left: `calc(36px + ${freqToNorm(item.f)} * (100% - 36px))` }}
             >
               {item.lbl}
             </span>
           ))}
         </div>
 
-        {/* Hold / Average / Freq Range Bar */}
+        {/* Hold / Average / Slope / Freq Range Bar */}
         <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 bg-[#16191e] border-b border-black text-[11px]">
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-1.5">
@@ -448,12 +520,24 @@ export const SpectrumModal: React.FC<SpectrumModalProps> = ({
                 <option value="Slow">Slow</option>
               </select>
             </div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-slate-300">Slope</span>
+              <select
+                value={slopeDbOct}
+                onChange={(e) => setSlopeDbOct(Number(e.target.value) as 0 | 3 | 4.5)}
+                className="bg-[#232730] text-cyan-300 border border-black/70 rounded px-2 py-0.5 text-[11px]"
+              >
+                <option value={0}>0 dB/oct</option>
+                <option value={3}>+3 dB/oct</option>
+                <option value={4.5}>+4.5 dB/oct</option>
+              </select>
+            </div>
           </div>
 
           <div className="flex items-center gap-1.5">
             <span className="text-slate-300">Freq. Range</span>
             <span className="px-2.5 py-0.5 rounded bg-[#232730] border border-black/70 font-mono-tabular text-[#60a5fa]">
-              20.0 Hz &nbsp; 20.00 k
+              20.0 Hz · 20.00 k (8192 FFT)
             </span>
           </div>
         </div>

@@ -25,6 +25,7 @@ export const CompressorModal: React.FC<CompressorModalProps> = ({
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const draggingNodeRef = useRef(false);
+  const lastRedRef = useRef(0);
   const [reductionDb, setReductionDb] = useState(0);
 
   const p = plugin.params;
@@ -157,7 +158,10 @@ export const CompressorModal: React.FC<CompressorModalProps> = ({
           const metrics = audioEngine.getChannelStereoMetrics(channel.id);
           const inLevelDb = Math.max(-60, Math.min(0, linearToDb(Math.max(metrics.peakL, metrics.peakR))));
           const liveRed = plugin.enabled ? audioEngine.getChannelReduction(channel.id) : 0;
-          setReductionDb(liveRed);
+          if (Math.abs(liveRed - lastRedRef.current) >= 0.05) {
+            lastRedRef.current = liveRed;
+            setReductionDb(liveRed);
+          }
 
           if (inLevelDb > -59) {
             const dotX = dbToX(inLevelDb);

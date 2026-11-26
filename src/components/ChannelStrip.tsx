@@ -493,12 +493,27 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
   };
 
   const cycleInputSource = () => {
-    onUpdate((c) => {
-      const order: ChannelState['inputSource'][] = ['none', 'demo', 'mic'];
-      const idx = order.indexOf(c.inputSource);
-      const next = order[(idx + 1) % order.length];
-      return { ...c, inputSource: next };
-    });
+    const order: ChannelState['inputSource'][] = ['none', 'demo', 'mic'];
+    const idx = order.indexOf(channel.inputSource);
+    const next = order[(idx + 1) % order.length];
+    if (next === 'none') {
+      onSelectInput?.(channel.id, 'none', 0, 'None');
+    } else if (next === 'demo') {
+      onSelectInput?.(channel.id, 'demo', channel.index, `Stem In ${channel.index}`);
+    } else {
+      const label =
+        channel.inputLabel && !channel.inputLabel.startsWith('Stem ')
+          ? channel.inputLabel
+          : `${asioConfig?.activeDeviceName ?? 'ASIO'} In ${channel.inputChannelIndex || channel.index}`;
+      onSelectInput?.(
+        channel.id,
+        'mic',
+        channel.inputChannelIndex || channel.index,
+        label,
+        channel.inputDeviceId ?? asioConfig?.inputDeviceId,
+        channel.micChannelMode ?? 'mono-lr'
+      );
+    }
   };
 
   const cycleMicChannelMode = () => {
@@ -763,11 +778,13 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                     <span className="w-3.5 flex items-center justify-center shrink-0">
                       {(channel.inputSource === 'demo' ||
                         channel.inputSource === 'file' ||
-                        channel.inputSource === 'app') && (
+                        channel.inputSource === 'app' ||
+                        (channel.inputSource === 'mic' &&
+                          isStereoVirtualInputLabel(channel.inputLabel ?? ''))) && (
                         <Check className="w-3.5 h-3.5 text-white" />
                       )}
                     </span>
-                    <span>Musik (File / Tab)</span>
+                    <span>Audio Laptop / Firefox</span>
                   </span>
                   <ChevronRight className="w-3.5 h-3.5 text-slate-300" />
                 </button>
@@ -963,53 +980,144 @@ export const ChannelStrip: React.FC<ChannelStripProps> = ({
                 </div>
               )}
 
-              {activeInputSubmenu === 'music' && (
-                <div className="w-[225px] bg-[#2a2e33] border border-[#454b52] rounded-[3px] shadow-[0_14px_32px_rgba(0,0,0,0.9)] py-1 -ml-[1px] text-[11px] text-[#e4e8ec]">
-                  <div className="px-2.5 py-1 text-[9.5px] font-semibold text-[var(--theme-neon-soft)] border-b border-white/10">
-                    Sumber Musik Sederhana
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setShowInputMenu(false);
-                      fileInputRef.current?.click();
-                    }}
-                    className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left text-emerald-300 font-medium block"
-                  >
-                    Pilih File Musik (.mp3 / .wav)...
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onSelectInput?.(
-                        channel.id,
-                        'app',
-                        channel.index,
-                        'Audio Tab / Layar',
-                        'app-capture',
-                        'stereo'
-                      );
-                      setShowInputMenu(false);
-                    }}
-                    className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left flex items-center justify-between gap-1"
-                  >
-                    <span className="truncate">Audio Tab / Layar (Chrome/Edge)</span>
-                    {channel.inputSource === 'app' && (
-                      <Check className="w-3 h-3 text-amber-300 shrink-0" />
+              {activeInputSubmenu === 'music' && (() => {
+                const virtualMusicInputs = inputDevices.filter((d) =>
+                  isStereoVirtualInputLabel(d.label)
+                );
+                return (
+                  <div className="w-[265px] max-h-80 overflow-y-auto console-scroll bg-[#2a2e33] border border-[#454b52] rounded-[3px] shadow-[0_14px_32px_rgba(0,0,0,0.9)] py-1 -ml-[1px] text-[11px] text-[#e4e8ec]">
+                    <div className="px-2.5 py-1 text-[9.5px] font-semibold text-emerald-300 border-b border-white/10">
+                      Audio Firefox / Laptop (Virtual Stereo)
+                    </div>
+
+                    {virtualMusicInputs.length > 0 ? (
+                      virtualMusicInputs.map((dev) => (
+                        <button
+                          key={dev.deviceId}
+                          type="button"
+                          onClick={() => {
+                            onSelectInput?.(
+                              channel.id,
+                              'mic',
+                              channel.index,
+                              dev.label,
+                              dev.deviceId,
+                              'stereo'
+                            );
+                            setShowInputMenu(false);
+                          }}
+                          className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left flex items-center justify-between gap-2 text-emerald-200 font-medium"
+                        >
+                          <span className="truncate">{dev.label}</span>
+                          {channel.inputSource === 'mic' && channel.inputDeviceId === dev.deviceId && (
+                            <Check className="w-3 h-3 text-emerald-400 shrink-0" />
+                          )}
+                        </button>
+                      ))
+                    ) : (
+                      <div className="px-2.5 py-1.5 text-[10px] text-slate-300 space-y-1">
+                        <div>Belum ada Stereo Mix / VB-Cable / Maono VC terdeteksi.</div>
+                        {(['Maono VC In 1 + 2', 'CABLE Output (VB-Audio)', 'Stereo Mix'] as const).map(
+                          (quickLbl) => (
+                            <button
+                              key={quickLbl}
+                              type="button"
+                              onClick={() => {
+                                onSelectInput?.(
+                                  channel.id,
+                                  'mic',
+                                  channel.index,
+                                  quickLbl,
+                                  undefined,
+                                  'stereo'
+                                );
+                                setShowInputMenu(false);
+                              }}
+                              className="w-full px-2 py-1 rounded bg-[#1d2229] hover:bg-[#3e444c] text-left text-[10.5px] text-emerald-300 border border-white/10 flex items-center justify-between"
+                            >
+                              <span className="truncate">{quickLbl}</span>
+                              <span className="text-[9px] text-slate-400">Auto</span>
+                            </button>
+                          )
+                        )}
+                      </div>
                     )}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onSelectInput?.(channel.id, 'demo', channel.index, `Stem In ${channel.index}`);
-                      setShowInputMenu(false);
-                    }}
-                    className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left block"
-                  >
-                    Demo Stem (Synth)
-                  </button>
-                </div>
-              )}
+
+                    {onScanOutputDevices && (
+                      <div className="px-2 py-1 border-b border-white/10">
+                        <button
+                          type="button"
+                          disabled={scanningInputs}
+                          onClick={async () => {
+                            setScanningInputs(true);
+                            try {
+                              await onScanOutputDevices();
+                            } finally {
+                              setScanningInputs(false);
+                            }
+                          }}
+                          className="w-full py-1 px-2 rounded bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-400/35 text-[10px] font-semibold text-emerald-200 text-center transition-colors"
+                        >
+                          {scanningInputs ? 'Memindai...' : 'Scan Stereo Mix / VB-Cable / VC In'}
+                        </button>
+                      </div>
+                    )}
+
+                    <div className="px-2.5 pt-1.5 pb-0.5 text-[9.5px] font-semibold text-[var(--theme-neon-soft)]">
+                      File &amp; Browser Capture
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowInputMenu(false);
+                        fileInputRef.current?.click();
+                      }}
+                      className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left text-cyan-300 font-medium block"
+                    >
+                      Pilih File Musik (.mp3 / .wav)...
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onSelectInput?.(
+                          channel.id,
+                          'app',
+                          channel.index,
+                          'Audio Tab / Layar',
+                          'app-capture',
+                          'stereo'
+                        );
+                        setShowInputMenu(false);
+                      }}
+                      className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left flex items-center justify-between gap-1"
+                    >
+                      <span className="truncate">Tangkap Layar / Tab (Chrome/Edge)</span>
+                      {channel.inputSource === 'app' && (
+                        <Check className="w-3 h-3 text-amber-300 shrink-0" />
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onSelectInput?.(channel.id, 'demo', channel.index, `Stem In ${channel.index}`);
+                        setShowInputMenu(false);
+                      }}
+                      className="w-full px-2.5 py-1.5 hover:bg-[#3e444c] text-left block"
+                    >
+                      Demo Stem (Synth)
+                    </button>
+
+                    <div className="mx-2 mt-1 mb-1 p-1.5 rounded bg-[#181b20] border border-white/10 text-[9.5px] leading-snug text-slate-300">
+                      <strong className="text-amber-300">Tips Firefox / Laptop:</strong> Buka{' '}
+                      <span className="text-white">Windows Sound → Volume Mixer</span>, arahkan output{' '}
+                      <span className="text-white">Firefox</span> ke{' '}
+                      <span className="text-emerald-300">CABLE Input / Maono VC 1-2</span> (atau aktifkan{' '}
+                      <span className="text-emerald-300">Stereo Mix</span>), lalu klik{' '}
+                      <span className="text-emerald-300">Scan</span> &amp; pilih di atas.
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           )}
         </div>

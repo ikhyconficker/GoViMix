@@ -1,7 +1,7 @@
 import { AudioDeviceInfo, MicChannelMode } from '../types/mixer';
 
 export function isStereoVirtualInputLabel(label: string): boolean {
-  return /\b(vc|virtual|loopback|stereo\s*mix|cable|what\s*u\s*hear|line\s*in|aux)\b/i.test(label);
+  return /\b(vc|virtual|loopback|stereo\s*mix|cable|vb-audio|voicemeeter|vaio|what\s*u\s*hear|line\s*in|aux)\b/i.test(label);
 }
 
 export function inferMicChannelMode(label: string): MicChannelMode {
